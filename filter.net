@@ -1,0 +1,14 @@
+* Simple RC Filter Circuit
+* Input -> R1 -> Node1 -> C1 -> GND
+*           |                |
+*           +---- R2 ----+---- Output
+
+V1  in   gnd  5
+R1  in   node1  1k
+R2  node1 out  2k
+C1  node1 gnd  10u
+C2  out  gnd  22p
+
+* Additional components for testing
+L1  node1 node2  100u
+D1  node2 gnd  1N4148

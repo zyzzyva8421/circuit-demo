@@ -1,0 +1,34 @@
+* Test Circuit - Simple RC Filter with Transistor
+* Verilog-style netlist
+
+* Power and Ground
+V1  vdd   gnd  1.8
+V2  in    gnd  0  PULSE(0 1.8 0 1ns 1ns 10ns 20ns)
+
+* Resistors
+R1  vdd   n1   10k
+R2  n1    n2   5k
+R3  n2    out  2k
+R4  out   gnd  1k
+
+* Capacitors
+C1  n1    gnd  10p
+C2  n2    gnd  22p
+C3  out   gnd  47p
+
+* Inductor
+L1  vdd   n1   100n
+
+* MOSFET transistors (simplified)
+M1  n1    in   gnd  gnd  nmos  W=1u  L=0.18u
+M2  out   n1   vdd  vdd  pmos  W=2u  L=0.18u
+
+* Diode
+D1  n2    gnd  D1N4148
+
+* Current source
+I1  vdd   n3   1mA
+
+* Additional components for more complex netlist
+R5  n3    gnd  500
+C4  n3    gnd  100p

@@ -1,0 +1,15 @@
+{
+  "name": "circuit-demo",
+  "version": "1.0.0",
+  "description": "``` * Comment line R1 in  gnd  1k R2 out gnd  2k C1 in  out  10n V1  in  gnd  5 ```",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "elkjs": "^0.11.1"
+  }
+}

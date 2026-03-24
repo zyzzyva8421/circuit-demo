@@ -1,0 +1,25 @@
+* Test Circuit - Simple RC Filter
+* Format: <name> <node1> <node2> [value]
+
+* Power supplies
+V1  vdd   gnd  1.8
+
+* Input source
+V2  in    gnd  5
+
+* Resistors
+R1  in    node1  1k
+R2  node1 node2  2k
+R3  node2 out   500
+
+* Capacitors
+C1  node1 gnd   10u
+C2  node2 gnd   22u
+C3  out   gnd   47u
+
+* Inductor
+L1  node1 node2  100u
+
+* Additional nodes for testing
+R4  node3 gnd    1k
+C4  node3 gnd    100p

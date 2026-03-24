@@ -1,0 +1,71 @@
+{
+  "id": "root",
+  "layoutOptions": {
+    "elk.algorithm": "box",
+    "elk.spacing.nodeNode": 60,
+    "elk.layered.spacing.nodeNodeBetweenLayers": 60,
+    "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX"
+  },
+  "children": [
+    {
+      "id": "inst_cpu",
+      "width": 80,
+      "height": 200,
+      "layoutOptions": {
+        "elk.portConstraints": "FIXED_ORDER",
+        "elk.spacing.portPort": 20,
+        "elk.padding": "[10, 10, 10, 10]"
+      },
+      "ports": [
+        {
+          "id": "inst_cpu_clk",
+          "width": 4,
+          "height": 4,
+          "layoutOptions": {
+            "elk.port.side": "WEST",
+            "elk.port.index": 0
+          }
+        },
+        {
+          "id": "inst_cpu_mem_addr",
+          "width": 4,
+          "height": 4,
+          "layoutOptions": {
+             "elk.port.side": "EAST",
+             "elk.port.index": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "inst_mem",
+       "width": 80,
+       "height": 200,
+       "layoutOptions": {
+         "elk.portConstraints": "FIXED_ORDER",
+         "elk.spacing.portPort": 20,
+         "elk.padding": "[10, 10, 10, 10]"
+       },
+       "ports": [
+          {
+            "id": "inst_mem_clk",
+            "width": 4,
+            "height": 4,
+            "layoutOptions": {
+               "elk.port.side": "WEST",
+               "elk.port.index": 3
+            }
+          }
+       ]
+    }
+  ],
+  "edges": [
+    {
+       "id": "e0",
+       "sources": ["inst_cpu"],
+       "targets": ["inst_mem"],
+       "sourcePort": "inst_cpu_mem_addr",
+       "targetPort": "inst_mem_clk"
+    }
+  ]
+}

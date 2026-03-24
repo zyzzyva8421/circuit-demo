@@ -1,0 +1,79 @@
+{
+  "id": "root",
+  "layoutOptions": {
+    "org.eclipse.elk.algorithm": "layered",
+    "org.eclipse.elk.direction": "RIGHT",
+    "org.eclipse.elk.spacing.nodeNode": 60,
+    "org.eclipse.elk.layered.spacing.nodeNodeBetweenLayers": 60,
+    "org.eclipse.elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX"
+  },
+  "children": [
+    {
+      "id": "inst_cpu",
+      "width": 80,
+      "height": 200,
+      "layoutOptions": {
+        "org.eclipse.elk.portConstraints": "FIXED_POS",
+        "org.eclipse.elk.nodeSize.constraints": "FIXED"
+      },
+      "ports": [
+        {
+          "id": "inst_cpu_clk",
+          "width": 4,
+          "height": 4,
+          "x": 0,
+          "y": 100,
+          "layoutOptions": { 
+             "org.eclipse.elk.port.side": "WEST",
+             "org.eclipse.elk.port.x": 0,
+             "org.eclipse.elk.port.y": 100
+          }
+        },
+        {
+          "id": "inst_cpu_mem_addr",
+          "width": 4,
+          "height": 4,
+          "x": 76,
+          "y": 50,
+          "layoutOptions": { 
+             "org.eclipse.elk.port.side": "EAST",
+             "org.eclipse.elk.port.x": 76,
+             "org.eclipse.elk.port.y": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "inst_mem",
+       "width": 80,
+       "height": 200,
+       "layoutOptions": {
+         "org.eclipse.elk.portConstraints": "FIXED_POS",
+         "org.eclipse.elk.nodeSize.constraints": "FIXED"
+       },
+       "ports": [
+          {
+            "id": "inst_mem_clk",
+            "width": 4,
+            "height": 4,
+            "x": 0,
+            "y": 50,
+            "layoutOptions": { 
+               "org.eclipse.elk.port.side": "WEST",
+               "org.eclipse.elk.port.x": 0,
+               "org.eclipse.elk.port.y": 50
+            }
+          }
+       ]
+    }
+  ],
+  "edges": [
+    {
+       "id": "e0",
+       "sources": ["inst_cpu"],
+       "targets": ["inst_mem"],
+       "sourcePort": "inst_cpu_mem_addr",
+       "targetPort": "inst_mem_clk"
+    }
+  ]
+}
