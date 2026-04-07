@@ -30,12 +30,14 @@ public:
 
 protected:
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
     
 private slots:
     void openFile();
     void zoomIn();
     void zoomOut();
     void resetZoom();
+    void fitInView();
     void onModuleChanged(const QString& moduleName);
 
 private:
@@ -57,6 +59,7 @@ private:
     
     // Draw helpers
     void drawEdges();
+    void drawInstancePins(CNode* n, double cx, double cy);
     void drawInstance(CNode* n, double cx, double cy);
     void drawPort(const GraphNodeData& data, double x, double y, double w, double h);
     void drawNetJoint(const GraphNodeData& data, double x, double y, double w, double h);

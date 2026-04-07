@@ -147,9 +147,10 @@ private:
                  continue;
              }
              if (token == "wire" || token == "reg") continue;
-             if (token.find('[') != std::string::npos) continue; // Skip ranges
+             if (token.find('[') != std::string::npos) continue; // Skip ranges like [31:0]
              
-             // Assume it's a name
+             // Verify it's a valid identifier (not a number/range)
+             if (!token.empty() && std::isdigit(token[0])) continue;
              Port port;
              port.name = token;
              port.direction = currentDir;
@@ -170,6 +171,8 @@ private:
            auto nameIt = std::sregex_iterator(names.begin(), names.end(), nameRegex);
            for (; nameIt != std::sregex_iterator(); ++nameIt) {
                std::string n = (*nameIt).str();
+               // Skip numeric values from bit ranges like [31:0]
+               if (!n.empty() && std::isdigit(n[0])) continue;
                // check explicitly if it's already in ports
                bool found = false;
                for(auto& p : module.ports) {
@@ -214,7 +217,13 @@ private:
             std::smatch match;
             if (std::regex_search(statement, match, instRegex)) {
                 std::string type = match[1];
-                if (type == "module" || type == "input" || type == "output" || type == "inout" || type == "wire" || type == "reg" || type == "always") continue;
+                // Skip Verilog/SystemVerilog keywords that aren't modules
+                if (type == "module" || type == "input" || type == "output" || type == "inout" || 
+                    type == "wire" || type == "reg" || type == "always" || type == "assign" ||
+                    type == "if" || type == "else" || type == "case" || type == "for" || type == "while" ||
+                    type == "begin" || type == "end" || type == "initial" || type == "generate" ||
+                    type == "endgenerate" || type == "endcase" || type == "endt" || type == "task" ||
+                    type == "function" || type == "endfunction" || type == "endtask") continue;
 
                 Instance inst;
                 inst.type = type;

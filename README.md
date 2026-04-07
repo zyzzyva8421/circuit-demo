@@ -1,4 +1,4 @@
-# Circuit Schematic Demo with Qt + OGDF
+# Circuit Schematic Demo with Qt + ELK
 
 ## Netlist Format (Simple SPICE-like)
 

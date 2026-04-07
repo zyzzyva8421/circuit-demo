@@ -21,10 +21,6 @@ include_directories(
     /usr/local/include
 )
 
-# No more OGDF
-# find_library(OGDF_LIBRARY NAMES OGDF PATHS /usr/local/lib)
-# find_path(OGDF_INCLUDE_DIR NAMES ogdf/basic/Graph.h PATHS /usr/local/include)
-
 # Create executable
 add_executable(circuit-demo
     main.cpp

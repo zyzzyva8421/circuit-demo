@@ -107,7 +107,7 @@ public:
             n->data.instancePtr = &inst;
             n->width = 80; n->height = 60; // Default, will be updated
 
-            // Generate Ports for Layout
+            // Generate Ports for Layout - only if submodule is defined in netlist
             if (netlist.modules.count(inst.type)) {
                 const Module& subMod = netlist.modules.at(inst.type);
                 std::vector<std::string> inputs, outputs;
@@ -154,12 +154,47 @@ public:
                      n->ports.push_back(p);
                 }
             } else {
-                 if (nodes.back() == n) { 
-                      nodes.pop_back(); 
-                      if(parent && !parent->children.empty() && parent->children.back()==n) parent->children.pop_back();
-                      else if (!rootNodes.empty() && rootNodes.back()==n) rootNodes.pop_back();
-                      delete n;
-                      continue; 
+                 // Submodule not defined - extract ports from instance connections
+                 // Try to determine direction from port names (common conventions)
+                 std::vector<std::string> inputs, outputs;
+                 for (const auto& pair : inst.portMap) {
+                     std::string pinName = pair.first;
+                     // Heuristic: common output pin names
+                     if (pinName == "Y" || pinName == "Q" || pinName == "X" || 
+                         pinName == "QN" || pinName == "CLK" || pinName == "CLKN") {
+                         outputs.push_back(pinName);
+                     } else {
+                         inputs.push_back(pinName);
+                     }
+                 }
+                 
+                 if (!inputs.empty() || !outputs.empty()) {
+                     double PIN_SPACING = 20.0;
+                     double MARGIN_Y = 10.0;
+                     size_t maxPins = std::max(inputs.size(), outputs.size());
+                     n->height = std::max(60.0, maxPins * PIN_SPACING + MARGIN_Y * 2);
+                     
+                     // Inputs on WEST
+                     double idealInputY = (n->height - (inputs.size() * PIN_SPACING)) / 2.0;
+                     int kIn = std::round((idealInputY - MARGIN_Y) / PIN_SPACING);
+                     double inputStartY = MARGIN_Y + kIn * PIN_SPACING;
+                     for (size_t i = 0; i < inputs.size(); ++i) {
+                          CPort p; p.name = inputs[i]; p.id = n->id + "_" + p.name;
+                          p.side = "WEST"; p.width = 4; p.height = 4;
+                          p.x = 0; p.y = inputStartY + i * PIN_SPACING + PIN_SPACING/2.0 - p.height/2.0; 
+                          n->ports.push_back(p);
+                     }
+                     
+                     // Outputs on EAST
+                     double idealOutputY = (n->height - (outputs.size() * PIN_SPACING)) / 2.0;
+                     int kOut = std::round((idealOutputY - MARGIN_Y) / PIN_SPACING);
+                     double outputStartY = MARGIN_Y + kOut * PIN_SPACING;
+                     for (size_t i = 0; i < outputs.size(); ++i) {
+                          CPort p; p.name = outputs[i]; p.id = n->id + "_" + p.name;
+                          p.side = "EAST"; p.width = 4; p.height = 4;
+                          p.x = n->width - p.width; p.y = outputStartY + i * PIN_SPACING + PIN_SPACING/2.0 - p.height/2.0;
+                          n->ports.push_back(p);
+                     }
                  }
             }
             
@@ -579,8 +614,7 @@ private:
                                 }
                             }
 
-                            // Snap points to ports with orthogonality (Removed to keep ELK router result)
-                            /*
+                            // Snap points to ports with orthogonality
                             if(!edge->points.empty()) {
                                 // Source Update
                                 if (edge->source) {
@@ -746,7 +780,6 @@ private:
                                     }
                                 }
                             }
-                            */
                         }
 
                     } catch (...) {}

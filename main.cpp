@@ -420,8 +420,20 @@ void selfTest() {
 
 void perfTest(std::string filename) {
     CircuitGraph graph;
-    std::cout << "Parsing high-fanout netlist: " << filename << std::endl;
-    Netlist netlist = NetlistParser::parse(filename);
+    std::cout << "Parsing netlist: " << filename << std::endl;
+    
+    // Resolve path - check current dir, then build dir, then parent dir
+    std::string resolvedPath = filename;
+    std::ifstream test(resolvedPath);
+    if (!test.good()) {
+        resolvedPath = "../" + filename;
+        test.open(resolvedPath);
+        if (!test.good()) {
+            resolvedPath = filename; // Fall back to original
+        }
+    }
+    
+    Netlist netlist = NetlistParser::parse(resolvedPath);
 
     if (netlist.modules.empty()) {
         std::cout << "Failed to parse modules from " << filename << std::endl;
@@ -438,6 +450,7 @@ void perfTest(std::string filename) {
     
     try {
         graph.buildHierarchical(netlist, topModule);
+        std::cout << "Graph build completed\n";
     } catch (const std::exception& e) {
         std::cout << "Build Exception: " << e.what() << std::endl;
         return;

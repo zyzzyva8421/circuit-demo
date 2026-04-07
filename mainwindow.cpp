@@ -114,6 +114,10 @@ MainWindow::MainWindow(QWidget *parent)
     connect(resetAct, &QAction::triggered, this, &MainWindow::resetZoom);
     toolbar->addAction(resetAct);
     
+    QAction *fitAct = new QAction("Fit", this);
+    connect(fitAct, &QAction::triggered, this, &MainWindow::fitInView);
+    toolbar->addAction(fitAct);
+    
     toolbar->addSeparator();
     backAction = new QAction("Build Hierarchy Back", this);
     connect(backAction, &QAction::triggered, this, &MainWindow::navigateBack);
@@ -183,6 +187,51 @@ void MainWindow::drawModule() {
     scene->update();
 }
 
+void MainWindow::drawInstancePins(CNode* n, double cx, double cy) {
+    const GraphNodeData& data = n->data;
+    double w = n->width;
+    double h = n->height;
+    double x = cx;  // CENTER
+    double y = cy;  // CENTER
+    
+    if (!n->ports.empty()) {
+        for(const auto& p : n->ports) {
+            double px = (cx - w/2) + p.x;
+            double py = (cy - h/2) + p.y;
+            scene->addRect(px, py, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
+            QGraphicsTextItem* t = scene->addText(QString::fromStdString(p.name));
+            t->setScale(0.6);
+            if (p.x < w / 2) t->setPos(px + 2, py - 8);
+            else t->setPos(px - 15, py - 8);
+        }
+    } else if (data.type == CircuitNodeType::ModuleInstance && currentNetlist.modules.count(data.moduleType)) {
+        // Fallback: use module ports from netlist
+        const Module& mod = currentNetlist.modules.at(data.moduleType);
+        std::vector<std::string> inputs, outputs;
+        for (const auto& p : mod.ports) {
+            if (p.direction == "input") inputs.push_back(p.name);
+            else outputs.push_back(p.name);
+        }
+        
+        double stepY = h / (inputs.size() + 1);
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            double py = (y - h/2) + stepY * (i + 1);
+            double px = x - w/2;
+            scene->addRect(px - 2, py - 2, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
+            QGraphicsTextItem* t = scene->addText(QString::fromStdString(inputs[i]));
+            t->setScale(0.6); t->setPos(px + 2, py - 8);
+        }
+        stepY = h / (outputs.size() + 1);
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            double py = (y - h/2) + stepY * (i + 1);
+            double px = x + w/2;
+            scene->addRect(px - 2, py - 2, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
+            QGraphicsTextItem* t = scene->addText(QString::fromStdString(outputs[i]));
+            t->setScale(0.6); t->setPos(px - 15, py - 8);
+        }
+    }
+}
+
 void MainWindow::drawInstance(CNode* n, double cx, double cy) {
     const GraphNodeData& data = n->data;
     double w = n->width;
@@ -200,43 +249,15 @@ void MainWindow::drawInstance(CNode* n, double cx, double cy) {
         rect->setData(1, QString::fromStdString(data.path)); 
         rect->setCursor(Qt::PointingHandCursor);
         
-        // Draw Pins
+        // Draw Pins from n->ports or module
+        drawInstancePins(n, cx, cy);
+    } else if (data.type == CircuitNodeType::ModuleInstance) {
+        // External module - still try to draw pins from n->ports
+        rect->setBrush(QColor(240, 240, 240)); 
+        rect->setPen(QPen(Qt::black, 1));
         if (!n->ports.empty()) {
-             for(const auto& p : n->ports) {
-                 double px = (cx - w/2) + p.x;
-                 double py = (cy - h/2) + p.y;
-                 scene->addRect(px, py, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
-                 QGraphicsTextItem* t = scene->addText(QString::fromStdString(p.name));
-                 t->setScale(0.6);
-                 if (p.x < w / 2) t->setPos(px + 2, py - 8);
-                 else t->setPos(px - 15, py - 8);
-             }
-        } else {
-            const Module& mod = currentNetlist.modules.at(data.moduleType);
-            std::vector<std::string> inputs, outputs;
-            for (const auto& p : mod.ports) {
-                if (p.direction == "input") inputs.push_back(p.name);
-                else outputs.push_back(p.name);
-            }
-            
-            double stepY = h / (inputs.size() + 1);
-            for (size_t i = 0; i < inputs.size(); ++i) {
-                double py = (y - h/2) + stepY * (i + 1);
-                double px = x - w/2;
-                scene->addRect(px - 2, py - 2, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
-                QGraphicsTextItem* t = scene->addText(QString::fromStdString(inputs[i]));
-                t->setScale(0.6); t->setPos(px + 2, py - 8);
-            }
-            stepY = h / (outputs.size() + 1);
-            for (size_t i = 0; i < outputs.size(); ++i) {
-                double py = (y - h/2) + stepY * (i + 1);
-                double px = x + w/2;
-                scene->addRect(px - 2, py - 2, 4, 4, QPen(Qt::black), QBrush(Qt::gray));
-                QGraphicsTextItem* t = scene->addText(QString::fromStdString(outputs[i]));
-                t->setScale(0.6); t->setPos(px - 15, py - 8);
-            }
+            drawInstancePins(n, cx, cy);
         }
-        
     } else {
         rect->setBrush(QColor(240, 240, 240)); 
         rect->setPen(QPen(Qt::black, 1));
@@ -284,9 +305,29 @@ void MainWindow::drawEdges() {
 void MainWindow::zoomIn() { view->scale(1.2, 1.2); }
 void MainWindow::zoomOut() { view->scale(1/1.2, 1/1.2); }
 void MainWindow::resetZoom() { view->resetTransform(); }
+void MainWindow::fitInView() {
+    view->resetTransform();
+    view->fitInView(scene->itemsBoundingRect(), Qt::KeepAspectRatio);
+    view->scale(0.9, 0.9); // Slight margin
+}
 
 void MainWindow::mouseDoubleClickEvent(QMouseEvent *event) {
     QMainWindow::mouseDoubleClickEvent(event);
+}
+
+void MainWindow::wheelEvent(QWheelEvent *event) {
+    // Only zoom when Ctrl is pressed, otherwise allow default pan behavior
+    if (event->modifiers() & Qt::ControlModifier) {
+        if (event->angleDelta().y() > 0) {
+            view->scale(1.1, 1.1);
+        } else {
+            view->scale(1/1.1, 1/1.1);
+        }
+        event->accept();
+    } else {
+        // Default pan behavior
+        QMainWindow::wheelEvent(event);
+    }
 }
 
 void MainWindow::navigateBack() {}
