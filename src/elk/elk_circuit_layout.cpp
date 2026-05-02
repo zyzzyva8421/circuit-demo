@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "circuitgraph.h"
+#include <unordered_set>
 #include "elk/elk.hpp"
 
 namespace {
@@ -98,6 +99,47 @@ bool isInputPortNode(const CNode* node) {
     return node->data.type == CircuitNodeType::Port && node->data.direction == "input";
 }
 
+bool verticalSegmentIntersectsRect(double x, double y0, double y1, const CNode* rectNode, double margin);
+bool horizontalSegmentIntersectsRect(double y, double x0, double x1, const CNode* rectNode, double margin);
+
+int countPolylineModuleCollisionsIndexed(
+    const std::vector<QPointF>& points,
+    const ModuleNodeIndex& modIdx,
+    const CNode* src,
+    const CNode* tgt,
+    double margin = 2.0
+) {
+    if (points.size() < 2) return 0;
+
+    std::unordered_set<const CNode*> hitNodes;
+    for (size_t i = 1; i < points.size(); ++i) {
+        const auto& a = points[i - 1];
+        const auto& b = points[i];
+
+        if (std::abs(a.x() - b.x()) < 0.001) {
+            double x = a.x();
+            auto [it0, it1] = modIdx.candidatesForX(x, margin);
+            for (auto it = it0; it != it1; ++it) {
+                const CNode* n = it->second;
+                if (n == src || n == tgt) continue;
+                if (verticalSegmentIntersectsRect(x, a.y(), b.y(), n, margin)) {
+                    hitNodes.insert(n);
+                }
+            }
+        } else if (std::abs(a.y() - b.y()) < 0.001) {
+            double y = a.y();
+            auto [it0, it1] = modIdx.candidatesForY(y, margin);
+            for (auto it = it0; it != it1; ++it) {
+                const CNode* n = it->second;
+                if (n == src || n == tgt) continue;
+                if (horizontalSegmentIntersectsRect(y, a.x(), b.x(), n, margin)) {
+                    hitNodes.insert(n);
+                }
+            }
+        }
+    }
+    return static_cast<int>(hitNodes.size());
+}
 bool isOutputPortNode(const CNode* node) {
     return node->data.type == CircuitNodeType::Port && node->data.direction == "output";
 }
@@ -2390,7 +2432,7 @@ void applyElkLayout(CircuitGraph& cg) {
         // Quick straight-line case only if horizontal segment is obstacle-free.
         if (std::abs(start.y() - end.y()) < 0.5) {
             double yDirect = start.y();
-            bool straightOk = skipExpensiveRouteOpts;
+            bool straightOk = false;
             if (!straightOk) {
                 yDirect = findSafeHorizontalChannelY(
                     start.y(), start.x(), end.x(),
@@ -2439,11 +2481,11 @@ void applyElkLayout(CircuitGraph& cg) {
             int lane = backwardLaneCounter++ % backwardLaneWindow;
             double baseChannelX = backChannelX + lane * std::max(trackGap, 8.0);
 
-            double yA = skipExpensiveRouteOpts ? start.y() : findSafeHorizontalChannelY(
+            double yA = findSafeHorizontalChannelY(
                 start.y(), start.x(), baseChannelX,
                 modIdx, edge->source, edge->target,
                 occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-            double yB = skipExpensiveRouteOpts ? end.y() : findSafeHorizontalChannelY(
+            double yB = findSafeHorizontalChannelY(
                 end.y(), baseChannelX, end.x(),
                 modIdx, edge->source, edge->target,
                 occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
@@ -2493,20 +2535,18 @@ void applyElkLayout(CircuitGraph& cg) {
                 yB = refineHorizontalY(yB, baseChannelX, end.x());
             }
 
-            double channelX = skipExpensiveRouteOpts ? baseChannelX : findSafeVerticalChannelX(
+            double channelX = findSafeVerticalChannelX(
                 baseChannelX, yA, yB,
                 modIdx, edge->source, edge->target,
                 occupiedVertical, trackGap, routeStep, safeMinX, safeMaxX + 5.0 * routeStep);
-            if (!skipExpensiveRouteOpts) {
-                yA = findSafeHorizontalChannelY(
-                    yA, start.x(), channelX,
-                    modIdx, edge->source, edge->target,
-                    occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-                yB = findSafeHorizontalChannelY(
-                    yB, channelX, end.x(),
-                    modIdx, edge->source, edge->target,
-                    occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-            }
+            yA = findSafeHorizontalChannelY(
+                yA, start.x(), channelX,
+                modIdx, edge->source, edge->target,
+                occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
+            yB = findSafeHorizontalChannelY(
+                yB, channelX, end.x(),
+                modIdx, edge->source, edge->target,
+                occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
 
             edge->points.push_back(QPointF(start.x(), yA));
             edge->points.push_back(QPointF(channelX, yA));
@@ -2582,11 +2622,9 @@ void applyElkLayout(CircuitGraph& cg) {
                     double xR = std::max(gX1, gX2);
                     double prefBusY = (start.y() + end.y()) * 0.5;
 
-                    double busY = skipExpensiveRouteOpts
-                        ? prefBusY
-                        : findSafeHorizontalChannelY(
-                            prefBusY, xL, xR, modIdx, edge->source, edge->target,
-                            occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
+                    double busY = findSafeHorizontalChannelY(
+                        prefBusY, xL, xR, modIdx, edge->source, edge->target,
+                        occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
 
                     if (!skipExpensiveRouteOpts && !occupiedVertical.empty()) {
                         auto countVCross = [&](double y) -> int {
@@ -2653,8 +2691,8 @@ void applyElkLayout(CircuitGraph& cg) {
         // Module-collision repair: only triggered for edges that pass through module bodies.
         // Scoring is O(nodes) only - no occupancy list scan to keep routing O(E * N).
         // For large graphs, skip this O(E*N) check entirely.
-        int baseModuleCollisions = skipExpensiveRouteOpts ? 0 : countPolylineModuleCollisions(
-            edge->points, cg.nodes, edge->source, edge->target, 2.0);
+        int baseModuleCollisions = countPolylineModuleCollisionsIndexed(
+            edge->points, modIdx, edge->source, edge->target, 2.0);
 
         if (baseModuleCollisions > 0) {
             auto buildRepairPath = [&](double busY) {
@@ -2682,7 +2720,7 @@ void applyElkLayout(CircuitGraph& cg) {
 
             // Score: module-collision count + bend penalty (no occupancy scan).
             auto repairScore = [&](const std::vector<QPointF>& p) {
-                int c = countPolylineModuleCollisions(p, cg.nodes, edge->source, edge->target, 2.0);
+                int c = countPolylineModuleCollisionsIndexed(p, modIdx, edge->source, edge->target, 2.0);
                 int b = std::max(0, static_cast<int>(p.size()) - 2);
                 return c * 100 + b;
             };
