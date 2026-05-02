@@ -132,10 +132,15 @@ MainWindow::MainWindow(QWidget *parent)
     toolbar->addWidget(layoutCombo);
 
     toolbar->addSeparator();
-    backAction = new QAction("Build Hierarchy Back", this);
+    backAction = new QAction("◀ Back", this);
     connect(backAction, &QAction::triggered, this, &MainWindow::navigateBack);
     backAction->setEnabled(false);
     toolbar->addAction(backAction);
+
+    toolbar->addSeparator();
+    breadcrumbLabel = new QLabel("  ");
+    breadcrumbLabel->setStyleSheet("color: #555; font-style: italic;");
+    toolbar->addWidget(breadcrumbLabel);
     
     QFileInfo fi("test_circuit.v");
     if(fi.exists()) loadNetlist(fi.absoluteFilePath());
@@ -152,6 +157,9 @@ void MainWindow::openFile() {
 
 void MainWindow::loadNetlist(const QString &filename) {
     currentNetlist = NetlistParser::parse(filename.toStdString());
+    navigationHistory.clear();
+    backAction->setEnabled(false);
+    breadcrumbLabel->setText("  ");
     moduleCombo->blockSignals(true);
     moduleCombo->clear();
     for (const auto& pair : currentNetlist.modules) {
@@ -169,7 +177,11 @@ void MainWindow::loadNetlist(const QString &filename) {
 }
 
 void MainWindow::onModuleChanged(const QString& moduleName) {
+    // Manual combo selection resets drill-down history
+    navigationHistory.clear();
+    backAction->setEnabled(false);
     currentModuleName = moduleName.toStdString();
+    updateBreadcrumb();
     drawModule();
 }
 
@@ -343,6 +355,24 @@ void MainWindow::fitInView() {
 }
 
 void MainWindow::mouseDoubleClickEvent(QMouseEvent *event) {
+    // Map window coordinates -> view -> scene
+    QPoint viewPos = view->mapFromGlobal(event->globalPos());
+    QPointF scenePos = view->mapToScene(viewPos);
+    QGraphicsItem* item = scene->itemAt(scenePos, view->transform());
+
+    // Walk up to find a rect item that carries module metadata
+    while (item) {
+        QGraphicsRectItem* rect = dynamic_cast<QGraphicsRectItem*>(item);
+        if (rect) {
+            QString moduleType = rect->data(0).toString();
+            if (!moduleType.isEmpty() && currentNetlist.modules.count(moduleType.toStdString())) {
+                navigateToModule(moduleType.toStdString());
+                event->accept();
+                return;
+            }
+        }
+        item = item->parentItem();
+    }
     QMainWindow::mouseDoubleClickEvent(event);
 }
 
@@ -361,7 +391,47 @@ void MainWindow::wheelEvent(QWheelEvent *event) {
     }
 }
 
-void MainWindow::navigateBack() {}
-void MainWindow::expandInstance(const std::string& s) {}
-void MainWindow::navigateToModule(const std::string& m) {}
+void MainWindow::navigateBack() {
+    if (navigationHistory.empty()) return;
+    currentModuleName = navigationHistory.back();
+    navigationHistory.pop_back();
+
+    // Sync combo without triggering onModuleChanged recursion
+    moduleCombo->blockSignals(true);
+    moduleCombo->setCurrentText(QString::fromStdString(currentModuleName));
+    moduleCombo->blockSignals(false);
+
+    backAction->setEnabled(!navigationHistory.empty());
+    updateBreadcrumb();
+    drawModule();
+    view->fitInView(scene->itemsBoundingRect(), Qt::KeepAspectRatio);
+    view->scale(0.9, 0.9);
+}
+
+void MainWindow::navigateToModule(const std::string& moduleName) {
+    if (moduleName == currentModuleName) return;
+    navigationHistory.push_back(currentModuleName);
+    currentModuleName = moduleName;
+
+    moduleCombo->blockSignals(true);
+    moduleCombo->setCurrentText(QString::fromStdString(currentModuleName));
+    moduleCombo->blockSignals(false);
+
+    backAction->setEnabled(true);
+    updateBreadcrumb();
+    drawModule();
+    view->fitInView(scene->itemsBoundingRect(), Qt::KeepAspectRatio);
+    view->scale(0.9, 0.9);
+}
+
+void MainWindow::updateBreadcrumb() {
+    QString crumb;
+    for (const auto& m : navigationHistory) {
+        crumb += QString::fromStdString(m) + " > ";
+    }
+    crumb += QString::fromStdString(currentModuleName);
+    breadcrumbLabel->setText("  " + crumb);
+}
+
+void MainWindow::expandInstance(const std::string& /*s*/) {}
 void MainWindow::clearScene() { scene->clear(); }

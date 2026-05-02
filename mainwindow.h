@@ -53,14 +53,16 @@ private:
     Netlist currentNetlist;
     std::string currentModuleName;
     CircuitGraph* circuitGraph;
-    std::vector<std::string> navigationHistory;
+    std::vector<std::string> navigationHistory;  // stack of previously viewed module names
     QAction* backAction;
+    QLabel* breadcrumbLabel;
 
     void loadNetlist(const QString &filename);
     void drawModule();
     void navigateToModule(const std::string& moduleName);
     void navigateBack();
     void expandInstance(const std::string& fullInstName);
+    void updateBreadcrumb();
     
     // Draw helpers
     void drawEdges();
