@@ -27,6 +27,9 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
+    void loadNetlistFile(const QString& filename) { loadNetlist(filename); }
+
+    enum class LayoutMode { CppElk, Elkjs };
 
 protected:
     void mouseDoubleClickEvent(QMouseEvent *event) override;
@@ -44,6 +47,8 @@ private:
     QGraphicsScene *scene;
     QGraphicsView *view;
     QComboBox *moduleCombo;
+    QComboBox *layoutCombo;
+    LayoutMode currentLayoutMode = LayoutMode::CppElk;
     
     Netlist currentNetlist;
     std::string currentModuleName;

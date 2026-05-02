@@ -1,1 +1,0 @@
-/usr/bin/g++ -g CMakeFiles/circuit-demo.dir/circuit-demo_autogen/mocs_compilation.cpp.o CMakeFiles/circuit-demo.dir/main.cpp.o CMakeFiles/circuit-demo.dir/mainwindow.cpp.o -o circuit-demo  /usr/lib/x86_64-linux-gnu/libQt5Widgets.so.5.15.3 /usr/lib/x86_64-linux-gnu/libQt5Gui.so.5.15.3 /usr/lib/x86_64-linux-gnu/libQt5Core.so.5.15.3 

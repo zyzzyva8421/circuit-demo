@@ -16,8 +16,11 @@
 #include <QDebug>
 #include <QFile>
 #include <QPointF>
+#include <QCoreApplication>
+#include <QDir>
 
 #include "netlistparser.h"
+#include "elk/elk_circuit_layout.hpp"
 
 enum class CircuitNodeType {
     ModuleInstance, 
@@ -333,45 +336,81 @@ public:
         }
     }
 
+    /**
+     * Apply layout using the direct C++ ELK interface.
+     */
     void applyLayout() {
-        QJsonObject root = toElkJson();
-        
+        applyElkLayout(*this);
+    }
+
+    /**
+     * Apply layout via elkjs (Node.js) subprocess.
+     * Serialises the graph to JSON, pipes it through layout_script.js,
+     * and reads back the positioned result.
+     */
+    void applyLayoutViaElkjs() {
+        QJsonObject json = toElkJson();
+        QJsonDocument doc(json);
+        QByteArray inputData = doc.toJson(QJsonDocument::Compact);
+
+        // Search for layout_script.js: next to executable, then one level up.
+        QString scriptPath;
+        QStringList candidates = {
+            QCoreApplication::applicationDirPath() + "/layout_script.js",
+            QCoreApplication::applicationDirPath() + "/../layout_script.js",
+            QDir::currentPath() + "/layout_script.js"
+        };
+        for (const auto& c : candidates) {
+            if (QFile::exists(c)) { scriptPath = c; break; }
+        }
+        if (scriptPath.isEmpty()) {
+            qWarning() << "applyLayoutViaElkjs: layout_script.js not found";
+            return;
+        }
+
         QProcess process;
-        process.setProcessChannelMode(QProcess::MergedChannels);
-        process.start("node", QStringList() << "layout_script.js");
-        
-        if (!process.waitForStarted()) {
-            std::cerr << "Failed to start node process\n";
+        process.start("node", QStringList() << scriptPath);
+        if (!process.waitForStarted(5000)) {
+            qWarning() << "applyLayoutViaElkjs: failed to start node:" << process.errorString();
             return;
         }
-        
-        QJsonDocument doc(root);
-        // Debug JSON
-        std::cerr << "--- ELK JSON Input ---" << std::endl;
-        std::cerr << doc.toJson(QJsonDocument::Indented).data() << std::endl;
-        std::cerr << "----------------------" << std::endl;
-        
-        process.write(doc.toJson(QJsonDocument::Compact));
+        process.write(inputData);
         process.closeWriteChannel();
-        
-        if (!process.waitForFinished(10000)) {
-            std::cerr << "Layout process timed out: " << process.readAll().data() << "\n";
+
+        // Prefer correctness over speed: no timeout by default.
+        // Override via ELKJS_TIMEOUT_MS (set to -1 for no timeout).
+        int timeoutMs = -1; // no timeout
+        const QByteArray timeoutEnv = qgetenv("ELKJS_TIMEOUT_MS");
+        if (!timeoutEnv.isEmpty()) {
+            bool ok = false;
+            const int parsed = QString::fromUtf8(timeoutEnv).toInt(&ok);
+            if (ok) timeoutMs = parsed;
+        }
+
+        const bool finished = (timeoutMs < 0)
+            ? process.waitForFinished(-1)
+            : process.waitForFinished(timeoutMs);
+
+        if (!finished) {
+            qWarning() << "applyLayoutViaElkjs: elkjs timed out after" << timeoutMs << "ms";
+            process.kill();
+            process.waitForFinished(5000);
             return;
         }
-        
-        QByteArray output = process.readAll();
-        QJsonDocument outDoc = QJsonDocument::fromJson(output);
-        if (outDoc.isNull()) {
-            std::cerr << "Failed to parse layout output: " << output.data() << "\n";
+
+        QByteArray errOutput = process.readAllStandardError();
+        if (!errOutput.isEmpty()) {
+            qWarning() << "elkjs stderr:" << errOutput;
+        }
+
+        QByteArray output = process.readAllStandardOutput();
+        QJsonParseError parseError;
+        QJsonDocument result = QJsonDocument::fromJson(output, &parseError);
+        if (result.isNull() || !result.isObject()) {
+            qWarning() << "applyLayoutViaElkjs: failed to parse elkjs output:" << parseError.errorString();
             return;
         }
-        
-        // Debug Output JSON
-        // std::cerr << "--- ELK JSON Output ---" << std::endl;
-        // std::cerr << outDoc.toJson(QJsonDocument::Indented).data() << std::endl;
-        // std::cerr << "-----------------------" << std::endl;
-        
-        applyElkJson(outDoc.object());
+        applyElkJson(result.object());
     }
 
 private:

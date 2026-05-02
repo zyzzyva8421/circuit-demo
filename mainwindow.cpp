@@ -119,6 +119,19 @@ MainWindow::MainWindow(QWidget *parent)
     toolbar->addAction(fitAct);
     
     toolbar->addSeparator();
+    toolbar->addWidget(new QLabel(" Layout: "));
+    layoutCombo = new QComboBox();
+    layoutCombo->addItem("C++ ELK");
+    layoutCombo->addItem("elkjs (Node)");
+    layoutCombo->setCurrentIndex(0);
+    connect(layoutCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int idx) {
+        currentLayoutMode = (idx == 1) ? LayoutMode::Elkjs : LayoutMode::CppElk;
+        drawModule();
+    });
+    toolbar->addWidget(layoutCombo);
+
+    toolbar->addSeparator();
     backAction = new QAction("Build Hierarchy Back", this);
     connect(backAction, &QAction::triggered, this, &MainWindow::navigateBack);
     backAction->setEnabled(false);
@@ -165,7 +178,25 @@ void MainWindow::drawModule() {
     if (currentModuleName.empty()) return;
     
     circuitGraph->buildFromModule(currentNetlist, currentModuleName);
-    circuitGraph->applyLayout();
+    if (currentLayoutMode == LayoutMode::Elkjs) {
+        circuitGraph->applyLayoutViaElkjs();
+
+        // If elkjs returns no route geometry (e.g. timeout/failed layout),
+        // fall back to C++ layout so schematic still renders correctly.
+        bool hasEdgeGeometry = false;
+        for (const auto* e : circuitGraph->edges) {
+            if (!e->points.empty()) {
+                hasEdgeGeometry = true;
+                break;
+            }
+        }
+        if (!hasEdgeGeometry) {
+            qWarning() << "elkjs produced no edge geometry; fallback to C++ ELK layout for rendering";
+            circuitGraph->applyLayout();
+        }
+    } else {
+        circuitGraph->applyLayout();
+    }
     
     // Draw Nodes
     for(CNode* n : circuitGraph->nodes) {

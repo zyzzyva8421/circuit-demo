@@ -1,8 +1,0 @@
-/home/aliu/circuit-demo/build/CMakeFiles/circuit-demo.dir
-/home/aliu/circuit-demo/build/CMakeFiles/edit_cache.dir
-/home/aliu/circuit-demo/build/CMakeFiles/rebuild_cache.dir
-/home/aliu/circuit-demo/build/CMakeFiles/list_install_components.dir
-/home/aliu/circuit-demo/build/CMakeFiles/install.dir
-/home/aliu/circuit-demo/build/CMakeFiles/install/local.dir
-/home/aliu/circuit-demo/build/CMakeFiles/install/strip.dir
-/home/aliu/circuit-demo/build/CMakeFiles/circuit-demo_autogen.dir

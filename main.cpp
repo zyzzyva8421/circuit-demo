@@ -30,6 +30,9 @@ int main(int argc, char *argv[]) {
     app.setApplicationVersion("1.0");
 
     MainWindow window;
+    if (argc > 2 && std::string(argv[1]) == "--open") {
+        window.loadNetlistFile(QString::fromStdString(argv[2]));
+    }
     window.show();
     
     return app.exec();
