@@ -60,9 +60,8 @@ public:
 
         std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        // Remove comments
-        content = std::regex_replace(content, std::regex("//.*"), ""); 
-        content = std::regex_replace(content, std::regex("/\\*[\\s\\S]*?\\*/"), "");
+        // Remove comments using a manual state machine (avoids std::regex stack overflow on large files)
+        content = stripComments(content);
 
         // Manual parsing instead of regex to handle large files (avoid stack overflow)
         size_t pos = 0;
@@ -202,8 +201,13 @@ private:
             std::replace(statement.begin(), statement.end(), '\r', ' ');
             std::replace(statement.begin(), statement.end(), '\t', ' ');
 
-            // Cleanup whitespace
-            statement = std::regex_replace(statement, std::regex("^\\s+|\\s+$"), "");
+            // Cleanup whitespace (manual trim to avoid regex stack issues)
+            {
+                size_t s = statement.find_first_not_of(" \t");
+                if (s == std::string::npos) continue;
+                size_t e = statement.find_last_not_of(" \t");
+                statement = statement.substr(s, e - s + 1);
+            }
             if (statement.empty()) continue;
 
             if (statement.rfind("assign", 0) == 0) {
@@ -211,24 +215,62 @@ private:
                  continue;
             }
             
-            // Should be an instance
-            // type name ( connections )
-            std::regex instRegex("(\\w+)\\s+(\\w+)\\s*\\((.*)\\)");
-            std::smatch match;
-            if (std::regex_search(statement, match, instRegex)) {
-                std::string type = match[1];
-                // Skip Verilog/SystemVerilog keywords that aren't modules
-                if (type == "module" || type == "input" || type == "output" || type == "inout" || 
-                    type == "wire" || type == "reg" || type == "always" || type == "assign" ||
-                    type == "if" || type == "else" || type == "case" || type == "for" || type == "while" ||
-                    type == "begin" || type == "end" || type == "initial" || type == "generate" ||
-                    type == "endgenerate" || type == "endcase" || type == "endt" || type == "task" ||
-                    type == "function" || type == "endfunction" || type == "endtask") continue;
+            // Should be an instance: type name ( connections )
+            // Manual parse to avoid regex stack overflow on long lines
+            {
+                // Extract first two words
+                size_t p0 = statement.find_first_not_of(" \t");
+                if (p0 == std::string::npos) continue;
+                size_t p1 = statement.find_first_of(" \t(", p0);
+                if (p1 == std::string::npos) continue;
+                std::string type = statement.substr(p0, p1 - p0);
 
+                // Skip keywords
+                static const std::set<std::string> kw = {
+                    "module","input","output","inout","wire","reg","always","assign",
+                    "if","else","case","for","while","begin","end","initial",
+                    "generate","endgenerate","endcase","task","function",
+                    "endfunction","endtask","localparam","parameter"
+                };
+                if (kw.count(type)) continue;
+
+                size_t p2 = statement.find_first_not_of(" \t", p1);
+                if (p2 == std::string::npos) continue;
+                // Skip optional #(...) parameter override
+                if (p2 < statement.size() && statement[p2] == '#') {
+                    size_t lp = statement.find('(', p2);
+                    if (lp == std::string::npos) continue;
+                    int depth = 1; size_t k = lp + 1;
+                    while (k < statement.size() && depth > 0) {
+                        if (statement[k] == '(') depth++;
+                        else if (statement[k] == ')') depth--;
+                        k++;
+                    }
+                    p2 = statement.find_first_not_of(" \t", k);
+                    if (p2 == std::string::npos) continue;
+                }
+                size_t p3 = statement.find_first_of(" \t(", p2);
+                if (p3 == std::string::npos) continue;
+                std::string instName = statement.substr(p2, p3 - p2);
+                if (instName.empty()) continue;
+
+                // Find the outermost ( ... ) for port list
+                size_t lp = statement.find('(', p3);
+                if (lp == std::string::npos) continue;
+                int depth = 1; size_t k = lp + 1;
+                while (k < statement.size() && depth > 0) {
+                    if (statement[k] == '(') depth++;
+                    else if (statement[k] == ')') depth--;
+                    k++;
+                }
+                std::string conns = statement.substr(lp + 1, k - lp - 2);
+
+            if (true) {
+                std::string type2 = type;
                 Instance inst;
-                inst.type = type;
-                inst.name = match[2];
-                std::string conns = match[3];
+                inst.type = type2;
+                inst.name = instName;
+                // conns is already extracted above by bracket-matching
                 
                 // Parse connections .port(net)
                 std::regex connRegex("\\.(\\w+)\\s*\\(([^)]*)\\)");
@@ -238,8 +280,42 @@ private:
                 }
                 
                 module.instances.push_back(inst);
-            }
+            } // if (true)
+            } // manual parse block
        }
+   }
+
+   // Strip // and /* */ comments using a character-level state machine.
+   // This avoids std::regex recursion stack overflow on large files.
+   static std::string stripComments(const std::string& src) {
+       std::string out;
+       out.reserve(src.size());
+       size_t i = 0, n = src.size();
+       while (i < n) {
+           if (i + 1 < n && src[i] == '/' && src[i+1] == '/') {
+               // Line comment: skip to end of line
+               while (i < n && src[i] != '\n') i++;
+           } else if (i + 1 < n && src[i] == '/' && src[i+1] == '*') {
+               // Block comment: skip to */
+               i += 2;
+               while (i + 1 < n && !(src[i] == '*' && src[i+1] == '/')) {
+                   if (src[i] == '\n') out += '\n'; // preserve line numbers
+                   i++;
+               }
+               i += 2; // skip */
+           } else if (src[i] == '"') {
+               // String literal: copy verbatim (handle escape sequences)
+               out += src[i++];
+               while (i < n && src[i] != '"') {
+                   if (src[i] == '\\') { out += src[i++]; }
+                   if (i < n) out += src[i++];
+               }
+               if (i < n) out += src[i++];
+           } else {
+               out += src[i++];
+           }
+       }
+       return out;
    }
 };
 
