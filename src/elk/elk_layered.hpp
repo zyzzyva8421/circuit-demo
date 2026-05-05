@@ -10,6 +10,9 @@
 
 namespace elk {
 
+// Main entry point for layered layout
+void layout(ElkGraph* graph);
+
 // Layering
 void longestPathLayering(LGraph* lgraph);
 

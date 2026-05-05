@@ -111,5 +111,39 @@ target_link_libraries(test_metrics_elkjs
     Threads::Threads
 )
 
+# Regression test executable
+add_executable(test_regression
+    test_regression.cpp
+    netlistparser.h
+    circuitgraph.h
+    src/elk/elk_circuit_layout.cpp
+    src/elk/elk_graph.cpp
+    src/elk/elk_layered.cpp
+)
+
+target_link_libraries(test_regression
+    Qt5::Core
+    Qt5::Gui
+    Qt5::Widgets
+    Threads::Threads
+)
+
+# Comparison test: C++ ELK vs elkjs
+add_executable(test_compare_elk
+    test_compare_elk.cpp
+    netlistparser.h
+    circuitgraph.h
+    src/elk/elk_circuit_layout.cpp
+    src/elk/elk_graph.cpp
+    src/elk/elk_layered.cpp
+)
+
+target_link_libraries(test_compare_elk
+    Qt5::Core
+    Qt5::Gui
+    Qt5::Widgets
+    Threads::Threads
+)
+
 # Install target
 install(TARGETS circuit-demo DESTINATION bin)

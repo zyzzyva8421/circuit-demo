@@ -9,6 +9,8 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <cctype>
+#include <cstring>
 
 // Use simple string for now, could be an enum
 using NodeType = std::string;
@@ -126,6 +128,59 @@ public:
             pos = endModule + 9;
         }
 
+        // Infer top module: prefer modules that are not instantiated by any other module.
+        // This avoids defaulting to the first module in file order (often a leaf macro).
+        if (!netlist.modules.empty()) {
+            std::set<std::string> instantiated;
+            for (const auto& mkv : netlist.modules) {
+                for (const auto& inst : mkv.second.instances) {
+                    if (netlist.modules.count(inst.type)) {
+                        instantiated.insert(inst.type);
+                    }
+                }
+            }
+
+            std::vector<std::string> roots;
+            for (const auto& mkv : netlist.modules) {
+                if (!instantiated.count(mkv.first)) {
+                    roots.push_back(mkv.first);
+                }
+            }
+
+            auto scoreTopName = [](const std::string& name) {
+                std::string s = name;
+                std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+                int score = 0;
+                if (s == "top") score += 100;
+                if (s.find("top") != std::string::npos) score += 20;
+                if (s.find("chip") != std::string::npos) score += 15;
+                if (s.find("soc") != std::string::npos) score += 15;
+                if (s.find("core") != std::string::npos) score += 10;
+                if (s.find("wrapper") != std::string::npos) score += 8;
+                // Boost for common top-level names like "ariane", "rocket", "boom", "hwacha"
+                if (s == "ariane" || s == "rocket" || s == "boom" || s == "hwacha") score += 200;
+                // Heuristic: prefer longer names (usually more specific/hierarchical)
+                score += std::min<int>(20, (int)name.size() / 5);
+                return score;
+            };
+
+            if (!roots.empty()) {
+                netlist.topModule = roots.front();
+                int bestInsts = (int)netlist.modules[netlist.topModule].instances.size();
+                int bestScore = scoreTopName(netlist.topModule);
+                for (const auto& m : roots) {
+                    int insts = (int)netlist.modules[m].instances.size();
+                    int sc = scoreTopName(m);
+                    // Prefer higher score first, then more instances as tiebreaker
+                    if (sc > bestScore || (sc == bestScore && insts > bestInsts)) {
+                        bestInsts = insts;
+                        bestScore = sc;
+                        netlist.topModule = m;
+                    }
+                }
+            }
+        }
+
         return netlist;
     }
 
@@ -137,6 +192,10 @@ private:
         auto end = std::sregex_iterator();
         
         std::string currentDir = "";
+        static const std::set<std::string> typeKeywords = {
+            "wire", "reg", "logic", "bit", "tri", "tri0", "tri1", "wand", "wor", "uwire",
+            "signed", "unsigned", "var", "const", "integer", "time", "byte", "shortint", "int", "longint"
+        };
         
         for (std::sregex_iterator i = begin; i != end; ++i) {
              std::string token = (*i).str();
@@ -145,7 +204,7 @@ private:
                  currentDir = token;
                  continue;
              }
-             if (token == "wire" || token == "reg") continue;
+             if (typeKeywords.count(token)) continue;
              if (token.find('[') != std::string::npos) continue; // Skip ranges like [31:0]
              
              // Verify it's a valid identifier (not a number/range)
@@ -158,36 +217,6 @@ private:
    }
 
    static void parseBody(Module& module, const std::string& body) {
-       // Identify input/output declarations to update ports
-       std::regex dirRegex("(input|output|inout)\\s+(?:wire|reg)?\\s*(?:\\[[^]]+\\])?\\s*([^;]+);");
-       auto dirBegin = std::sregex_iterator(body.begin(), body.end(), dirRegex);
-       for (auto i = dirBegin; i != std::sregex_iterator(); ++i) {
-           std::string dir = (*i)[1];
-           std::string names = (*i)[2];
-           
-           // Split names
-           std::regex nameRegex("(\\w+)"); // Ignoring ranges for mapping for now
-           auto nameIt = std::sregex_iterator(names.begin(), names.end(), nameRegex);
-           for (; nameIt != std::sregex_iterator(); ++nameIt) {
-               std::string n = (*nameIt).str();
-               // Skip numeric values from bit ranges like [31:0]
-               if (!n.empty() && std::isdigit(n[0])) continue;
-               // check explicitly if it's already in ports
-               bool found = false;
-               for(auto& p : module.ports) {
-                    if (p.name == n) {
-                        p.direction = dir;
-                        found = true;
-                    }
-               }
-               if(!found) {
-                   // ANSI style ports might be declared inline, but here we found a separate decl
-                   Port p; p.name = n; p.direction = dir;
-                   module.ports.push_back(p);
-               }
-           }
-       }
-
        // Parse instances: type name ( .port(net), ... );
        // Simplification: assume 1 instance per statement
        // Regex for instance: (\w+)\s+(\w+)\s*\(([^;]+)\)\s*;
@@ -209,6 +238,85 @@ private:
                 statement = statement.substr(s, e - s + 1);
             }
             if (statement.empty()) continue;
+
+            // Strip one or more leading Verilog/SystemVerilog attributes: (* ... *)
+            // Some synthesized netlists annotate instances this way.
+            while (statement.rfind("(*", 0) == 0) {
+                size_t attrEnd = statement.find("*)");
+                if (attrEnd == std::string::npos) break;
+                statement = statement.substr(attrEnd + 2);
+                size_t s2 = statement.find_first_not_of(" \t");
+                if (s2 == std::string::npos) {
+                    statement.clear();
+                    break;
+                }
+                size_t e2 = statement.find_last_not_of(" \t");
+                statement = statement.substr(s2, e2 - s2 + 1);
+            }
+            if (statement.empty()) continue;
+
+            // Parse non-ANSI direction declarations, e.g.:
+            // input logic [31:0] a, b
+            auto startsWithKw = [&](const char* kw) -> bool {
+                size_t n = std::strlen(kw);
+                if (statement.size() < n) return false;
+                if (statement.compare(0, n, kw) != 0) return false;
+                return statement.size() == n || std::isspace((unsigned char)statement[n]);
+            };
+
+            std::string dir;
+            if (startsWithKw("input")) dir = "input";
+            else if (startsWithKw("output")) dir = "output";
+            else if (startsWithKw("inout")) dir = "inout";
+
+            if (!dir.empty()) {
+                static const std::set<std::string> typeKeywords = {
+                    "wire", "reg", "logic", "bit", "tri", "tri0", "tri1", "wand", "wor", "uwire",
+                    "signed", "unsigned", "var", "const", "integer", "time", "byte", "shortint", "int", "longint"
+                };
+
+                std::vector<std::string> names;
+                bool inRange = false;
+                for (size_t i = 0; i < statement.size();) {
+                    char c = statement[i];
+                    if (c == '[') { inRange = true; ++i; continue; }
+                    if (c == ']') { inRange = false; ++i; continue; }
+
+                    if (!inRange && (std::isalpha((unsigned char)c) || c == '_')) {
+                        size_t j = i + 1;
+                        while (j < statement.size()) {
+                            char cj = statement[j];
+                            if (!(std::isalnum((unsigned char)cj) || cj == '_' || cj == '$')) break;
+                            ++j;
+                        }
+                        std::string tok = statement.substr(i, j - i);
+                        if (tok != dir && !typeKeywords.count(tok)) {
+                            names.push_back(tok);
+                        }
+                        i = j;
+                        continue;
+                    }
+                    ++i;
+                }
+
+                for (const auto& n : names) {
+                    bool found = false;
+                    for (auto& p : module.ports) {
+                        if (p.name == n) {
+                            p.direction = dir;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        Port p;
+                        p.name = n;
+                        p.direction = dir;
+                        module.ports.push_back(p);
+                    }
+                }
+                continue;
+            }
 
             if (statement.rfind("assign", 0) == 0) {
                  module.assigns.push_back(statement);
@@ -272,11 +380,55 @@ private:
                 inst.name = instName;
                 // conns is already extracted above by bracket-matching
                 
-                // Parse connections .port(net)
-                std::regex connRegex("\\.(\\w+)\\s*\\(([^)]*)\\)");
-                auto connBegin = std::sregex_iterator(conns.begin(), conns.end(), connRegex);
-                for (auto i = connBegin; i != std::sregex_iterator(); ++i) {
-                     inst.portMap[(*i)[1]] = (*i)[2];
+                // Parse connections .port(net) with a manual scanner.
+                // Supports nested parentheses in net expressions and avoids regex stack overflow.
+                size_t ci = 0;
+                while (ci < conns.size()) {
+                    // Find next '.' starting a named port connection
+                    while (ci < conns.size() && conns[ci] != '.') ++ci;
+                    if (ci >= conns.size()) break;
+                    ++ci; // skip '.'
+
+                    // Parse port name
+                    size_t ps = ci;
+                    if (ps >= conns.size() || !(std::isalpha((unsigned char)conns[ps]) || conns[ps] == '_')) {
+                        continue;
+                    }
+                    ++ci;
+                    while (ci < conns.size()) {
+                        char ch = conns[ci];
+                        if (!(std::isalnum((unsigned char)ch) || ch == '_' || ch == '$')) break;
+                        ++ci;
+                    }
+                    std::string portName = conns.substr(ps, ci - ps);
+
+                    // Skip whitespace to '('
+                    while (ci < conns.size() && std::isspace((unsigned char)conns[ci])) ++ci;
+                    if (ci >= conns.size() || conns[ci] != '(') {
+                        continue;
+                    }
+                    ++ci; // skip '('
+
+                    // Parse expression until matching ')'
+                    int depth2 = 1;
+                    size_t es = ci;
+                    while (ci < conns.size() && depth2 > 0) {
+                        if (conns[ci] == '(') depth2++;
+                        else if (conns[ci] == ')') depth2--;
+                        ++ci;
+                    }
+                    if (depth2 != 0 || ci <= es) {
+                        continue;
+                    }
+
+                    std::string expr = conns.substr(es, (ci - 1) - es);
+                    // Trim whitespace
+                    size_t ts = expr.find_first_not_of(" \t");
+                    size_t te = expr.find_last_not_of(" \t");
+                    if (ts == std::string::npos) expr.clear();
+                    else expr = expr.substr(ts, te - ts + 1);
+
+                    inst.portMap[portName] = expr;
                 }
                 
                 module.instances.push_back(inst);

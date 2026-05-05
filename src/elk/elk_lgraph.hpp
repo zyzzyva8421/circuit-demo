@@ -91,13 +91,20 @@ public:
     
     int columnSpan() const { return columnSpan_; }
     void setColumnSpan(int span) { columnSpan_ = span; }
-    
+
+    double x() const { return x_; }
+    double y() const { return y_; }
+    void setX(double x) { x_ = x; }
+    void setY(double y) { y_ = y; }
+
 private:
     ElkNode* elkNode_;
     int layerIndex_;
     int position_;
     double width_;
     double height_;
+    double x_ = 0.0;
+    double y_ = 0.0;
     std::vector<LPort*> ports_;
     int longestPathHeight_ = 1;
     double barycenter_ = 0;
@@ -186,6 +193,13 @@ public:
     
     const std::vector<std::unique_ptr<LNode>>& nodes() const { return lnodes_; }
     std::vector<std::unique_ptr<LNode>>& nodes() { return lnodes_; }
+
+    const std::vector<std::unique_ptr<LEdge>>& edges() const { return ledges_; }
+    std::vector<std::unique_ptr<LEdge>>& edges() { return ledges_; }
+
+    void addEdge(std::unique_ptr<LEdge> edge) {
+        ledges_.push_back(std::move(edge));
+    }
     
     int layerCount() const { return static_cast<int>(layers_.size()); }
     

@@ -5,14 +5,19 @@
 #include "elk_circuit_layout.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <map>
 #include <random>
 #include <set>
 #include <chrono>
+#include <atomic>
 #include <future>
+#include <queue>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "circuitgraph.h"
@@ -26,6 +31,8 @@ namespace {
 struct ModuleNodeIndex {
     // Maps y_center -> CNode* for ModuleInstance/ExpandedInstance nodes.
     std::multimap<double, const CNode*> byYMid;
+    // Maps x_center -> CNode* for fast X-range candidate queries.
+    std::multimap<double, const CNode*> byXMid;
 
     // Returns iterator range for nodes whose Y extent might overlap [yLo, yHi].
     // Uses conservative over-approximation: center in [yLo - maxHalfH, yHi + maxHalfH].
@@ -39,7 +46,9 @@ struct ModuleNodeIndex {
             if (n->data.type != CircuitNodeType::ModuleInstance &&
                 n->data.type != CircuitNodeType::ExpandedInstance) continue;
             double cy = n->y + n->height * 0.5;
+            double cx = n->x + n->width * 0.5;
             byYMid.emplace(cy, n);
+            byXMid.emplace(cx, n);
             maxHalfH = std::max(maxHalfH, n->height * 0.5 + 4.0);
             maxHalfW = std::max(maxHalfW, n->width  * 0.5 + 4.0);
         }
@@ -56,10 +65,9 @@ struct ModuleNodeIndex {
     std::pair<std::multimap<double,const CNode*>::const_iterator,
               std::multimap<double,const CNode*>::const_iterator>
     candidatesForX(double x, double margin) const {
-        // For vertical segments we query all modules (no X index) — but we
-        // can still use the Y range to limit to modules with potential overlap.
-        // Here just return all.
-        return {byYMid.begin(), byYMid.end()};
+        double lo = x - maxHalfW - margin;
+        double hi = x + maxHalfW + margin;
+        return {byXMid.lower_bound(lo), byXMid.upper_bound(hi)};
     }
 };
 
@@ -93,6 +101,25 @@ struct VerticalSeg {
     double x;
     double y0;
     double y1;
+};
+
+// Sorted container for VerticalSeg allowing O(log N) X-range queries.
+struct SortedVSegs {
+    // sorted by x
+    std::multimap<double, std::pair<double,double>> data; // x -> (y0,y1)
+
+    void push_back(const VerticalSeg& s) {
+        data.emplace(s.x, std::make_pair(s.y0, s.y1));
+    }
+    void push_back(VerticalSeg&& s) {
+        data.emplace(s.x, std::make_pair(s.y0, s.y1));
+    }
+    bool empty() const { return data.empty(); }
+    size_t size() const { return data.size(); }
+    // Range query: all segs with x in [xLo, xHi]
+    auto range(double xLo, double xHi) const {
+        return std::make_pair(data.lower_bound(xLo), data.upper_bound(xHi));
+    }
 };
 
 bool isInputPortNode(const CNode* node) {
@@ -224,7 +251,7 @@ double findSafeVerticalChannelX(
     const ModuleNodeIndex& modIdx,
     const CNode* src,
     const CNode* tgt,
-    const std::vector<VerticalSeg>& occupied,
+    const SortedVSegs& occupied,
     double trackGap,
     double step,
     double minX,
@@ -243,8 +270,9 @@ double findSafeVerticalChannelX(
             }
         }
 
-        for (const auto& seg : occupied) {
-            if (std::abs(seg.x - x) < trackGap && rangesOverlap(y0, y1, seg.y0, seg.y1)) {
+        auto [ov0, ov1] = occupied.range(x - trackGap + 0.001, x + trackGap - 0.001);
+        for (auto it = ov0; it != ov1; ++it) {
+            if (rangesOverlap(y0, y1, it->second.first, it->second.second)) {
                 ++conflicts;
             }
         }
@@ -252,11 +280,12 @@ double findSafeVerticalChannelX(
         return conflicts;
     };
 
-    if (conflictCountAt(preferredX) == 0) {
+    const int preferredConflicts = conflictCountAt(preferredX);
+    if (preferredConflicts == 0) {
         return preferredX;
     }
 
-    int bestConflicts = conflictCountAt(preferredX);
+    int bestConflicts = preferredConflicts;
     double bestX = preferredX;
 
     for (int delta = 1; delta <= 80; ++delta) {
@@ -296,6 +325,20 @@ double findSafeHorizontalChannelY(
     double minY,
     double maxY
 ) {
+    auto overlapSumAt = [&](double y) -> double {
+        double sum = 0.0;
+        // O(log N + k): only segs within trackGap of y
+        auto [ht0, ht1] = occupied.range(y - trackGap + 0.001, y + trackGap - 0.001);
+        for (auto it = ht0; it != ht1; ++it) {
+            if (rangesOverlap(x0, x1, it->second.first, it->second.second)) {
+                double oLo = std::max(x0, it->second.first);
+                double oHi = std::min(x1, it->second.second);
+                sum += (oHi - oLo);
+            }
+        }
+        return sum;
+    };
+
     auto conflictCountAt = [&](double y) {
         int conflicts = 0;
         // O(log N + k): only module nodes whose Y center is near y
@@ -308,40 +351,44 @@ double findSafeHorizontalChannelY(
             }
         }
 
-        // O(log N + k): only segs within trackGap of y
-        auto [ht0, ht1] = occupied.range(y - trackGap + 0.001, y + trackGap - 0.001);
-        for (auto it = ht0; it != ht1; ++it) {
-            if (rangesOverlap(x0, x1, it->second.first, it->second.second)) {
-                ++conflicts;
-            }
-        }
+        // Accumulate conflict overlaps with segs
+        double overlapSum = overlapSumAt(y);
+        if (overlapSum > trackGap) ++conflicts;  // Each large-overlap counts as major conflict
 
         return conflicts;
     };
 
-    if (conflictCountAt(preferredY) == 0) {
+    const double preferredOverlap = overlapSumAt(preferredY);
+    const int preferredConflicts = conflictCountAt(preferredY);
+    
+    if (preferredConflicts == 0 && preferredOverlap < 1.0) {
         return preferredY;
     }
 
-    int bestConflicts = conflictCountAt(preferredY);
+    int bestConflicts = preferredConflicts;
+    double bestOverlap = preferredOverlap;
     double bestY = preferredY;
 
     for (int delta = 1; delta <= 120; ++delta) {
         double down = preferredY + delta * step;
         if (down <= maxY) {
             int dc = conflictCountAt(down);
-            if (dc == 0) return down;
-            if (dc < bestConflicts) {
+            double dov = overlapSumAt(down);
+            if (dc == 0 && dov < 1.0) return down;
+            if (dc < bestConflicts || (dc == bestConflicts && dov < bestOverlap)) {
                 bestConflicts = dc;
+                bestOverlap = dov;
                 bestY = down;
             }
         }
         double up = preferredY - delta * step;
         if (up >= minY) {
             int uc = conflictCountAt(up);
-            if (uc == 0) return up;
-            if (uc < bestConflicts) {
+            double uov = overlapSumAt(up);
+            if (uc == 0 && uov < 1.0) return up;
+            if (uc < bestConflicts || (uc == bestConflicts && uov < bestOverlap)) {
                 bestConflicts = uc;
+                bestOverlap = uov;
                 bestY = up;
             }
         }
@@ -475,6 +522,116 @@ void simplifyOrthogonalPolyline(std::vector<QPointF>& points, double eps = 0.001
 
 } // namespace
 
+// Forward declaration so layoutExpandedChildrenInternal can call applyElkLayout recursively.
+void applyElkLayout(CircuitGraph& cg);
+
+// Recursively layout the children of an expanded instance node.
+// After this call:
+//   - All children have local x/y coordinates (relative to the expanded node origin).
+//   - expandedNode->width/height are resized to fit the children + padding.
+//   - expandedNode->ports are updated to match the positions of child Port nodes.
+static void layoutExpandedChildrenInternal(CircuitGraph& cg, CNode* expandedNode) {
+    if (expandedNode->children.empty()) return;
+
+    // Recursively pre-layout nested expanded instances first (bottom-up)
+    for (auto* child : expandedNode->children) {
+        if (child->data.type == CircuitNodeType::ExpandedInstance) {
+            layoutExpandedChildrenInternal(cg, child);
+        }
+    }
+
+    // Save the graph state and temporarily redirect to children sub-graph
+    std::vector<CNode*> savedNodes    = std::move(cg.nodes);
+    std::vector<CEdge*> savedEdges    = std::move(cg.edges);
+    std::vector<CNode*> savedRootNodes = std::move(cg.rootNodes);
+
+    cg.nodes     = expandedNode->children;
+    cg.rootNodes = expandedNode->children;
+
+    // Collect edges that belong entirely within this level
+    std::set<CNode*> childSet(expandedNode->children.begin(), expandedNode->children.end());
+    for (auto* e : savedEdges) {
+        if (childSet.count(e->source) && childSet.count(e->target)) {
+            cg.edges.push_back(e);
+        }
+    }
+
+    // Run layout on children
+    applyElkLayout(cg);
+
+    // Compute children bounding box (including edge waypoints)
+    constexpr double INF = std::numeric_limits<double>::max();
+    double minX = INF, minY = INF;
+    double maxX = -INF, maxY = -INF;
+
+    for (auto* c : expandedNode->children) {
+        minX = std::min(minX, c->x);
+        minY = std::min(minY, c->y);
+        maxX = std::max(maxX, c->x + c->width);
+        maxY = std::max(maxY, c->y + c->height);
+    }
+    for (auto* e : cg.edges) {
+        for (const auto& pt : e->points) {
+            if (std::isfinite(pt.x()) && std::isfinite(pt.y())) {
+                minX = std::min(minX, pt.x());
+                minY = std::min(minY, pt.y());
+                maxX = std::max(maxX, pt.x());
+                maxY = std::max(maxY, pt.y());
+            }
+        }
+    }
+    if (!std::isfinite(minX)) { minX = minY = 0; maxX = maxY = 60; }
+
+    constexpr double PADDING  = 40.0;
+    constexpr double HEADER_H = 25.0;
+
+    // Shift children so that content starts at (PADDING, PADDING + HEADER_H)
+    double offsetX = PADDING - minX;
+    double offsetY = (PADDING + HEADER_H) - minY;
+    for (auto* c : expandedNode->children) {
+        c->x += offsetX;
+        c->y += offsetY;
+    }
+    for (auto* e : cg.edges) {
+        for (auto& pt : e->points) {
+            pt.setX(pt.x() + offsetX);
+            pt.setY(pt.y() + offsetY);
+        }
+    }
+
+    // Resize the expanded instance to contain all children + padding
+    double contentW = maxX - minX;
+    double contentH = maxY - minY;
+    expandedNode->width  = contentW + 2.0 * PADDING;
+    expandedNode->height = contentH + 2.0 * PADDING + HEADER_H;
+
+    // Rebuild the expanded instance's port list to match child Port node positions.
+    // These ports are used by the parent-level layout for edge attachment.
+    expandedNode->ports.clear();
+    for (auto* child : expandedNode->children) {
+        if (child->data.type != CircuitNodeType::Port) continue;
+        CPort p;
+        p.name   = child->data.id;
+        p.id     = expandedNode->id + "_" + p.name;
+        p.width  = child->width;
+        p.height = child->height;
+        p.y      = child->y + child->height / 2.0 - p.height / 2.0;
+        if (child->data.direction == "input") {
+            p.side = "WEST";
+            p.x    = 0.0;
+        } else {
+            p.side = "EAST";
+            p.x    = expandedNode->width - p.width;
+        }
+        expandedNode->ports.push_back(p);
+    }
+
+    // Restore graph state
+    cg.nodes     = std::move(savedNodes);
+    cg.edges     = std::move(savedEdges);
+    cg.rootNodes = std::move(savedRootNodes);
+}
+
 void applyElkLayout(CircuitGraph& cg) {
     auto phaseStart = std::chrono::steady_clock::now();
     auto logPhase = [&](const char* phase) {
@@ -484,13 +641,94 @@ void applyElkLayout(CircuitGraph& cg) {
         phaseStart = now;
     };
 
+    // ---- Hierarchical pre-layout for expanded instances ----
+    // If any root-level node is an ExpandedInstance, do a bottom-up sub-graph layout
+    // first, then filter cg.nodes/edges to the root level before running the main pass.
+    bool didHierarchicalFilter = false;
+    std::vector<CNode*> savedHierNodes;
+    std::vector<CEdge*> savedHierEdges;
+
+    {
+        bool hasExpanded = false;
+        for (auto* n : cg.rootNodes) {
+            if (n->data.type == CircuitNodeType::ExpandedInstance) {
+                hasExpanded = true;
+                break;
+            }
+        }
+
+        if (hasExpanded) {
+            // Bottom-up: pre-layout each expanded instance's children
+            for (auto* n : cg.rootNodes) {
+                if (n->data.type == CircuitNodeType::ExpandedInstance) {
+                    layoutExpandedChildrenInternal(cg, n);
+                }
+            }
+
+            savedHierNodes = cg.nodes;
+            savedHierEdges = cg.edges;
+            didHierarchicalFilter = true;
+
+            // Build mapping from child port nodes to their parent ExpandedInstance
+            // so that parent-level edges are properly redirected.
+            std::map<CNode*, std::pair<CNode*, std::string>> portNodeToExpanded;
+            for (auto* n : cg.rootNodes) {
+                if (n->data.type != CircuitNodeType::ExpandedInstance) continue;
+                for (auto* child : n->children) {
+                    if (child->data.type == CircuitNodeType::Port) {
+                        portNodeToExpanded[child] = {n, child->data.id};
+                    }
+                }
+            }
+
+            // Filter nodes to root level only
+            cg.nodes = cg.rootNodes;
+
+            // Redirect edges: child port node endpoints → parent ExpandedInstance
+            std::set<CNode*> rootSet(cg.rootNodes.begin(), cg.rootNodes.end());
+            cg.edges.clear();
+            for (auto* e : savedHierEdges) {
+                CNode* src = e->source;
+                CNode* tgt = e->target;
+                std::string srcPort = e->sourcePort;
+                std::string tgtPort = e->targetPort;
+
+                auto srcIt = portNodeToExpanded.find(src);
+                if (srcIt != portNodeToExpanded.end()) {
+                    src     = srcIt->second.first;
+                    srcPort = srcIt->second.second;
+                }
+                auto tgtIt = portNodeToExpanded.find(tgt);
+                if (tgtIt != portNodeToExpanded.end()) {
+                    tgt     = tgtIt->second.first;
+                    tgtPort = tgtIt->second.second;
+                }
+
+                // Skip self-loops (edges that ended up inside the same expanded instance)
+                if (src == tgt) continue;
+
+                // Only keep edges between root-level nodes
+                if (!rootSet.count(src) || !rootSet.count(tgt)) continue;
+
+                // Temporarily patch the edge for the root-level layout pass.
+                // (The original source/target are restored after layout.)
+                e->source     = src;
+                e->target     = tgt;
+                e->sourcePort = srcPort;
+                e->targetPort = tgtPort;
+                cg.edges.push_back(e);
+            }
+        }
+    }
+    // ---- end hierarchical pre-layout ----
+
     elk::ElkGraph graph("circuit");
     graph.options().setAlgorithm(elk::Algorithm::LAYERED);
     graph.options().setDirection(elk::Direction::RIGHT);
     graph.options().setNodePlacement(elk::NodePlacementStrategy::BRANDES_KOEPF);
-    graph.options().spacing().nodeNode = 60.0;
-    graph.options().spacing().nodeNodeBetweenLayers = 60.0;
-    graph.options().spacing().portPort = 10.0;
+    graph.options().spacing().nodeNode = 34.0;
+    graph.options().spacing().nodeNodeBetweenLayers = 38.0;
+    graph.options().spacing().portPort = 8.0;
     graph.options().setPortBorderOffset(0.0);
 
     std::map<CNode*, elk::ElkNode*> elkNodeMap;
@@ -537,6 +775,91 @@ void applyElkLayout(CircuitGraph& cg) {
 
     logPhase("build graph nodes/edges");
 
+    // ---- Call modular elk::layout() for P2/P4 (layering + node placement) ----
+    // This calls longestPathLayering() + brandesKoepfPlace() on the ElkGraph,
+    // writing Y coordinates to ElkNode objects via LNode.setY()
+    // NOTE: Currently informational only - the inline BK in applyElkLayout produces
+    // better Y values. The modular code will be used once horizontalCompaction is fixed.
+    // Disabled: elk::layout() produces verbose debug output and is not yet used.
+    // elk::layout(&graph);
+
+    // Extract Y coordinates from ElkNode back to CNode for reference
+    std::map<CNode*, double> modularY;
+    for (size_t index = 0; index < cg.nodes.size(); ++index) {
+        CNode* node = cg.nodes[index];
+        auto* elkNode = elkNodeMap[node];
+        if (elkNode) {
+            modularY[node] = elkNode->y();
+        }
+    }
+
+    // Debug: print modular Y range vs inline Y range
+    {
+        double modMinY = std::numeric_limits<double>::infinity();
+        double modMaxY = -std::numeric_limits<double>::infinity();
+        for (auto& kv : modularY) {
+            modMinY = std::min(modMinY, kv.second);
+            modMaxY = std::max(modMaxY, kv.second);
+        }
+        fprintf(stderr, "[MODULAR-DEBUG] Y range: %.1f to %.1f (span=%.1f)\n",
+                modMinY, modMaxY, modMaxY - modMinY);
+    }
+
+    // ---- Plan B: Greedy cycle breaking via iterative DFS ----
+    // Detect back-edges (feedback edges) and skip them during Bellman-Ford
+    // layering. Without this, cyclic netlists (e.g. ariane) diverge to 100+
+    // layers, creating millions of dummy nodes and causing std::bad_alloc.
+    std::unordered_set<CEdge*> reversedEdges;
+    {
+        std::unordered_map<CNode*, std::vector<CEdge*>> adjOut;
+        adjOut.reserve(cg.nodes.size());
+        for (auto* e : cg.edges) adjOut[e->source].push_back(e);
+
+        // Three-color DFS: 0=unvisited, 1=on-stack, 2=done
+        std::unordered_map<CNode*, int> color;
+        color.reserve(cg.nodes.size() * 2);
+        for (auto* n : cg.nodes) color[n] = 0;
+
+        // Iterative DFS to avoid stack overflow on large graphs
+        struct DfsFrame { CNode* node; size_t idx; };
+        std::vector<DfsFrame> dfsStk;
+        dfsStk.reserve(256);
+
+        for (auto* root : cg.nodes) {
+            if (color[root] != 0) continue;
+            color[root] = 1;
+            dfsStk.push_back({root, 0});
+            while (!dfsStk.empty()) {
+                DfsFrame& f = dfsStk.back();
+                auto aIt = adjOut.find(f.node);
+                bool pushed = false;
+                if (aIt != adjOut.end()) {
+                    const auto& adj = aIt->second;
+                    while (f.idx < adj.size()) {
+                        CEdge* e = adj[f.idx++];
+                        CNode* v = e->target;
+                        if (v == f.node) continue; // self-loop
+                        if (color[v] == 1) {
+                            reversedEdges.insert(e); // back-edge: reverses the cycle
+                        } else if (color[v] == 0) {
+                            color[v] = 1;
+                            dfsStk.push_back({v, 0});
+                            pushed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!pushed) {
+                    color[f.node] = 2;
+                    dfsStk.pop_back();
+                }
+            }
+        }
+        fprintf(stderr, "[CYCLE-BREAK] reversed=%d / %d edges\n",
+                (int)reversedEdges.size(), (int)cg.edges.size());
+    }
+    // ---- end cycle breaking ----
+
     for (auto* node : cg.nodes) {
         if (isInputPortNode(node)) {
             layerMap[node] = 0;
@@ -550,6 +873,7 @@ void applyElkLayout(CircuitGraph& cg) {
     for (size_t pass = 0; pass < cg.nodes.size(); ++pass) {
         bool changed = false;
         for (auto* edge : cg.edges) {
+            if (reversedEdges.count(edge)) continue; // skip feedback edges (Plan B)
             if (isOutputPortNode(edge->target)) {
                 continue;
             }
@@ -686,22 +1010,75 @@ void applyElkLayout(CircuitGraph& cg) {
     std::map<int, std::vector<PlacementSlot>> extLayers = buildExtLayers(baseLayers);
 
     // O(layer_size) lookup helpers; layers are small so this is fast.
+    // =================================================================
+    // Plan A: O(1) position lookup maps for findReal/findDummy.
+    // Maintained incrementally: rebuilt on full extLayers reassignment,
+    // updated in O(1) on each swap.
+    // =================================================================
+    std::map<int, std::unordered_map<CNode*, int>>         realPosInLayer;
+    std::map<int, std::unordered_map<long long, int>>      dummyPosInLayer;
+
+    auto encodeKey = [](int eidx, int step) -> long long {
+        return (long long)eidx * 65536LL + step;
+    };
+
+    auto rebuildPosIndex = [&]() {
+        realPosInLayer.clear();
+        dummyPosInLayer.clear();
+        for (const auto& kv : extLayers) {
+            int L = kv.first;
+            auto& rm = realPosInLayer[L];
+            auto& dm = dummyPosInLayer[L];
+            rm.reserve(kv.second.size());
+            dm.reserve(kv.second.size());
+            for (int i = 0; i < (int)kv.second.size(); ++i) {
+                const auto& s = kv.second[i];
+                if (s.realNode) rm[s.realNode] = i;
+                else dm[encodeKey(s.edgeIdx, s.chainStep)] = i;
+            }
+        }
+    };
+
+    auto rebuildPosForLayer = [&](int L) {
+        auto& rm = realPosInLayer[L];
+        auto& dm = dummyPosInLayer[L];
+        rm.clear(); dm.clear();
+        if (!extLayers.count(L)) return;
+        const auto& sv = extLayers[L];
+        rm.reserve(sv.size()); dm.reserve(sv.size());
+        for (int i = 0; i < (int)sv.size(); ++i) {
+            const auto& s = sv[i];
+            if (s.realNode) rm[s.realNode] = i;
+            else dm[encodeKey(s.edgeIdx, s.chainStep)] = i;
+        }
+    };
+
+    // Call after std::swap(sv[i], sv[j]) to keep maps consistent.
+    auto updateSwap = [&](int L, int i, int j) {
+        const auto& sv = extLayers[L];
+        auto& rm = realPosInLayer[L];
+        auto& dm = dummyPosInLayer[L];
+        const auto& si = sv[i];
+        if (si.realNode) rm[si.realNode] = i;
+        else dm[encodeKey(si.edgeIdx, si.chainStep)] = i;
+        const auto& sj = sv[j];
+        if (sj.realNode) rm[sj.realNode] = j;
+        else dm[encodeKey(sj.edgeIdx, sj.chainStep)] = j;
+    };
+
+    rebuildPosIndex(); // initial index for baseLayers extLayers
+
     auto findReal = [&](int L, CNode* n) -> int {
-        auto it = extLayers.find(L);
-        if (it == extLayers.end()) return -1;
-        const auto& sv = it->second;
-        for (int i = 0; i < (int)sv.size(); ++i)
-            if (sv[i].realNode == n) return i;
-        return -1;
+        auto it = realPosInLayer.find(L);
+        if (it == realPosInLayer.end()) return -1;
+        auto it2 = it->second.find(n);
+        return it2 != it->second.end() ? it2->second : -1;
     };
     auto findDummy = [&](int L, int eidx, int step) -> int {
-        auto it = extLayers.find(L);
-        if (it == extLayers.end()) return -1;
-        const auto& sv = it->second;
-        for (int i = 0; i < (int)sv.size(); ++i)
-            if (!sv[i].realNode && sv[i].edgeIdx == eidx && sv[i].chainStep == step)
-                return i;
-        return -1;
+        auto it = dummyPosInLayer.find(L);
+        if (it == dummyPosInLayer.end()) return -1;
+        auto it2 = it->second.find(encodeKey(eidx, step));
+        return it2 != it->second.end() ? it2->second : -1;
     };
 
     auto portBias = [&](const CNode* node, const std::string& portName) -> double {
@@ -935,6 +1312,7 @@ void applyElkLayout(CircuitGraph& cg) {
                 mv    = std::move(mvSave);
                 nbPos = std::move(nbSave);
             }
+            rebuildPosForLayer(movingL); // keep map in sync after full layer reorder
         }
 
         // Adjacent swap refinement: local O(deg^2) per pair — no bilayerCrossings calls.
@@ -953,6 +1331,7 @@ void applyElkLayout(CircuitGraph& cg) {
                 }
                 if (c_ba < c_ab) {
                     std::swap(mv[i], mv[i + 1]);
+                    updateSwap(movingL, i, i + 1);
                     std::swap(nbPos[i], nbPos[i + 1]);
                     passChanged = true;
                     changedAny  = true;
@@ -999,6 +1378,7 @@ void applyElkLayout(CircuitGraph& cg) {
                 for (int na : nbRight[i]) for (int nb : nbRight[i+1]) { if (na > nb) ++c_ab; else if (na < nb) ++c_ba; }
                 if (c_ba < c_ab) {
                     std::swap(sv[i], sv[i + 1]);
+                    updateSwap(L, i, i + 1);
                     std::swap(nbLeft[i],  nbLeft[i + 1]);
                     std::swap(nbRight[i], nbRight[i + 1]);
                     anyChanged = true;
@@ -1050,6 +1430,7 @@ void applyElkLayout(CircuitGraph& cg) {
                     for (int na : nbRight[i]) for (int nb : nbRight[i+1]) { if (na > nb) ++c_ab; else if (na < nb) ++c_ba; }
                     if (c_ba < c_ab) {
                         std::swap(sv[i], sv[i + 1]);
+                        updateSwap(L, i, i + 1);
                         std::swap(nbLeft[i],  nbLeft[i + 1]);
                         std::swap(nbRight[i], nbRight[i + 1]);
                         passChanged = true;
@@ -1156,50 +1537,124 @@ void applyElkLayout(CircuitGraph& cg) {
             }
         }
         extLayers = buildExtLayers(initialLayers);
+        rebuildPosIndex(); // Plan A: sync position maps after full rebuild
+
+        // Plan D: for large graphs, skip expensive totalAdjacentCrossings per sweep;
+        // use anyChanged as convergence signal instead (output unchanged).
+        const bool useCrossingEval = (graphComplexity <= 50000);
 
         int noImproveStreak = 0;
-        int prevCrossingCount = totalAdjacentCrossings(layerOrder);
-        int bestInRestart = prevCrossingCount;
+        int bestInRestart = useCrossingEval ? totalAdjacentCrossings(layerOrder)
+                                            : std::numeric_limits<int>::max();
         std::map<int, std::vector<PlacementSlot>> bestInRestartLayers = extLayers;
         for (int sweep = 0; sweep < sweepCount; ++sweep) {
             bool anyChanged = false;
-            for (size_t i = 1; i < layerOrder.size(); ++i) {
-                if (improveBilayer(layerOrder[i - 1], layerOrder[i])) anyChanged = true;
+
+            // Plan C: parallel odd/even bilayer sweep using std::thread.
+            // improveBilayer(fixedL, movingL) only writes extLayers[movingL] and
+            // realPosInLayer[movingL]/dummyPosInLayer[movingL].  Batching into
+            // non-overlapping (fixedL,movingL) pairs ensures no data races.
+            // Each batch uses a local atomic to collect the "any changed" signal;
+            // the atomic is merge into anyChanged after threads join.
+            auto runParallelBatch = [&](const std::vector<std::pair<int,int>>& pairs) {
+                std::atomic<bool> batchChanged{false};
+                std::vector<std::thread> ts;
+                ts.reserve(pairs.size());
+                for (auto& [fL, mL] : pairs) {
+                    ts.emplace_back([&, fL, mL]() {
+                        if (improveBilayer(fL, mL))
+                            batchChanged.store(true, std::memory_order_relaxed);
+                    });
+                }
+                for (auto& t : ts) t.join();
+                if (batchChanged.load()) anyChanged = true;
+            };
+
+            auto runParallelSweepFwd = [&]() {
+                int sz = (int)layerOrder.size();
+                // Batch 1: gaps at gi=1,3,5,...  movingL = layerOrder[gi], no overlap.
+                { std::vector<std::pair<int,int>> p;
+                  for (int gi = 1; gi < sz; gi += 2)
+                      p.emplace_back(layerOrder[gi-1], layerOrder[gi]);
+                  runParallelBatch(p); }
+                // Batch 2: gaps at gi=2,4,6,...
+                { std::vector<std::pair<int,int>> p;
+                  for (int gi = 2; gi < sz; gi += 2)
+                      p.emplace_back(layerOrder[gi-1], layerOrder[gi]);
+                  runParallelBatch(p); }
+            };
+            auto runParallelSweepBwd = [&]() {
+                int sz = (int)layerOrder.size();
+                // Batch 1: gi=sz-2, sz-4, ...   movingL = layerOrder[gi], no overlap.
+                { std::vector<std::pair<int,int>> p;
+                  for (int gi = sz - 2; gi >= 0; gi -= 2)
+                      p.emplace_back(layerOrder[gi+1], layerOrder[gi]);
+                  runParallelBatch(p); }
+                // Batch 2: gi=sz-3, sz-5, ...
+                { std::vector<std::pair<int,int>> p;
+                  for (int gi = sz - 3; gi >= 0; gi -= 2)
+                      p.emplace_back(layerOrder[gi+1], layerOrder[gi]);
+                  runParallelBatch(p); }
+            };
+
+            // Parallel crossing sweep is optional: default off for stability.
+            // Enable with LAYOUT_PARALLEL_SWEEP=1 when benchmarking.
+            const bool enableParallelSweep = (qgetenv("LAYOUT_PARALLEL_SWEEP") == "1");
+            if (enableParallelSweep && graphComplexity > 5000) {
+                runParallelSweepFwd();
+                runParallelSweepBwd();
+            } else {
+                for (size_t i = 1; i < layerOrder.size(); ++i)
+                    if (improveBilayer(layerOrder[i - 1], layerOrder[i])) anyChanged = true;
+                for (int i = (int)layerOrder.size() - 2; i >= 0; --i)
+                    if (improveBilayer(layerOrder[i + 1], layerOrder[i])) anyChanged = true;
             }
-            for (int i = (int)layerOrder.size() - 2; i >= 0; --i) {
-                if (improveBilayer(layerOrder[i + 1], layerOrder[i])) anyChanged = true;
-            }
-            // For large graphs skip transpose/greedy-switch inside the per-sweep loop
-            // (they are O(N_layer * deg^2) and dominate runtime).
+
             if (graphComplexity <= 20000) {
                 if (runTranspose(layerOrder)) anyChanged = true;
                 if (runGreedySwitch(layerOrder, 2)) anyChanged = true;
             }
 
-            int crossingCount = totalAdjacentCrossings(layerOrder);
-            if (crossingCount < bestInRestart) {
-                bestInRestart = crossingCount;
-                bestInRestartLayers = extLayers;
-                noImproveStreak = 0;
+            if (useCrossingEval) {
+                int crossingCount = totalAdjacentCrossings(layerOrder);
+                if (crossingCount < bestInRestart) {
+                    bestInRestart = crossingCount;
+                    bestInRestartLayers = extLayers;
+                    noImproveStreak = 0;
+                } else {
+                    ++noImproveStreak;
+                }
             } else {
-                ++noImproveStreak;
+                // Large graph: treat any change as improvement, rely on anyChanged for convergence.
+                if (anyChanged) {
+                    bestInRestartLayers = extLayers;
+                    noImproveStreak = 0;
+                } else {
+                    ++noImproveStreak;
+                }
             }
-            prevCrossingCount = crossingCount;
 
             if (!anyChanged || noImproveStreak >= 5) break;
         }
         // Restore the best configuration found during this restart.
         extLayers = bestInRestartLayers;
+        rebuildPosIndex(); // Plan A: sync after restore
 
-        int finalCrossingCount = totalAdjacentCrossings(layerOrder);
-        if (finalCrossingCount < bestCrossingCount) {
-            bestCrossingCount = finalCrossingCount;
+        if (useCrossingEval) {
+            int finalCrossingCount = totalAdjacentCrossings(layerOrder);
+            if (finalCrossingCount < bestCrossingCount) {
+                bestCrossingCount = finalCrossingCount;
+                bestExtLayers = extLayers;
+            }
+        } else if (bestExtLayers.empty()) {
+            // Large-graph deterministic single mode: keep the final order.
             bestExtLayers = extLayers;
         }
     }
 
     if (!bestExtLayers.empty()) {
         extLayers = bestExtLayers;
+        rebuildPosIndex(); // Plan A: sync after final selection
     }
 
     logPhase("crossing minimization multi-start");
@@ -1672,7 +2127,7 @@ void applyElkLayout(CircuitGraph& cg) {
 
     // Apply a modest vertical stretch to match Java ELK's natural Y spread from BK block placement.
     // Java ELK nodes are ~1.65x more spread in Y due to node margins and block separation effects.
-    const double bkVerticalStretch = 1.25;
+    const double bkVerticalStretch = 1.05;
     for (auto& kv : yPos) kv.second *= bkVerticalStretch;
 
     for (const auto& kv : normalByLayer) {
@@ -1716,29 +2171,61 @@ void applyElkLayout(CircuitGraph& cg) {
     }
 
     auto placePorts = [&](int layer, std::vector<CNode*>& ports, bool isInput) {
-        std::stable_sort(ports.begin(), ports.end(), [&](CNode* left, CNode* right) {
-            auto connectedOrder = [&](CNode* node) {
-                std::vector<double> values;
-                const auto& peers = isInput ? successors[node] : predecessors[node];
-                for (auto* peer : peers) {
-                    auto found = orderIndex.find(peer);
-                    if (found != orderIndex.end()) values.push_back(static_cast<double>(found->second));
-                }
-                return average(values, static_cast<double>(sourceOrder[node]));
-            };
+        double lw = layerWidths.count(layer) ? layerWidths[layer] : 0.0;
+        struct PortPlacement {
+            CNode* node = nullptr;
+            double desiredCenterY = 0.0;
+            double desiredTopY = 0.0;
+        };
 
-            double leftScore = connectedOrder(left);
-            double rightScore = connectedOrder(right);
-            if (std::abs(leftScore - rightScore) > 0.001) return leftScore < rightScore;
-            return sourceOrder[left] < sourceOrder[right];
+        std::vector<PortPlacement> placements;
+        placements.reserve(ports.size());
+
+        for (auto* node : ports) {
+            std::vector<double> peerCenters;
+            const auto& peers = isInput ? successors[node] : predecessors[node];
+            for (auto* peer : peers) {
+                peerCenters.push_back(peer->y + peer->height * 0.5);
+            }
+
+            double desiredCenterY = average(
+                peerCenters,
+                static_cast<double>(sourceOrder[node]) * (node->height + 25.0) + node->height * 0.5
+            );
+            placements.push_back({node, desiredCenterY, desiredCenterY - node->height * 0.5});
+        }
+
+        std::stable_sort(placements.begin(), placements.end(), [&](const PortPlacement& left, const PortPlacement& right) {
+            if (std::abs(left.desiredCenterY - right.desiredCenterY) > 0.001) {
+                return left.desiredCenterY < right.desiredCenterY;
+            }
+            return sourceOrder[left.node] < sourceOrder[right.node];
         });
 
-        double portY = 0.0;
-        double lw = layerWidths.count(layer) ? layerWidths[layer] : 0.0;
-        for (auto* node : ports) {
-            node->x = layerX[layer] + 0.5 * (lw - node->width);
-            node->y = portY;
-            portY += node->height + 25.0;
+        constexpr double kPortGapY = 8.0;
+        for (size_t i = 0; i < placements.size(); ++i) {
+            double topY = std::max(0.0, placements[i].desiredTopY);
+            if (i > 0) {
+                const auto& prev = placements[i - 1];
+                topY = std::max(topY, prev.node->y + prev.node->height + kPortGapY);
+            }
+            placements[i].node->x = layerX[layer] + 0.5 * (lw - placements[i].node->width);
+            placements[i].node->y = topY;
+        }
+
+        if (placements.size() > 1) {
+            for (size_t idx = placements.size() - 1; idx-- > 0;) {
+                auto& curr = placements[idx];
+                const auto& next = placements[idx + 1];
+                double maxTopY = next.node->y - curr.node->height - kPortGapY;
+                double desiredTopY = std::max(0.0, curr.desiredTopY);
+                curr.node->y = std::min(curr.node->y, maxTopY);
+                curr.node->y = std::max(curr.node->y, desiredTopY);
+            }
+        }
+
+        for (const auto& placement : placements) {
+            placement.node->x = layerX[layer] + 0.5 * (lw - placement.node->width);
         }
     };
 
@@ -1849,31 +2336,27 @@ void applyElkLayout(CircuitGraph& cg) {
         maxNodeY = std::max(maxNodeY, n->y + n->height);
     }
 
-    // Precompute backward-edge routing channel: just to the right of the rightmost layer
     double rightmostBoundary = 0.0;
     for (const auto& kv : layerX) {
         double rx = kv.second + layerWidths[kv.first];
         if (rx > rightmostBoundary) rightmostBoundary = rx;
     }
-    double backChannelX = rightmostBoundary + graph.options().spacing().nodeNodeBetweenLayers;
     double routeStep = std::max(8.0, graph.options().spacing().portPort);
     double trackGap = std::max(20.0, routeStep * 2.0);
     int lanesPerGap = std::max(2, static_cast<int>(graph.options().spacing().nodeNodeBetweenLayers / std::max(8.0, trackGap)));
     lanesPerGap = std::min(lanesPerGap, 6);
-    int backwardLaneWindow = 24;
-    double safeMinX = minNodeX - 3.0 * graph.options().spacing().nodeNodeBetweenLayers;
-    double safeMaxX = backChannelX + graph.options().spacing().nodeNodeBetweenLayers
-                    + backwardLaneWindow * std::max(trackGap, 8.0);
+    double safeMinX = minNodeX - graph.options().spacing().nodeNodeBetweenLayers;
+    double safeMaxX = rightmostBoundary + graph.options().spacing().nodeNodeBetweenLayers;
     double safeMinY = minNodeY - 4.0 * graph.options().spacing().nodeNode;
     double safeMaxY = maxNodeY + 4.0 * graph.options().spacing().nodeNode;
 
-    // Build spatial index for module nodes (O(N log N) once, enables O(log N) collision queries).
+    // NOTE: modIdx will be built AFTER aspect scaling (below) so node X positions are current.
+    // Declare here so the lambdas that reference it can capture it by reference.
     ModuleNodeIndex modIdx;
-    modIdx.build(cg.nodes);
 
     // Occupancy maps for layered-like track allocation (avoid placing many segments on same channel).
     SortedHSegs occupiedHorizontal;
-    std::vector<VerticalSeg> occupiedVertical;
+    SortedVSegs occupiedVertical;
 
     auto chooseVerticalChannelX = [&](double preferredX,
                                       double y0,
@@ -1894,8 +2377,9 @@ void applyElkLayout(CircuitGraph& cg) {
                 }
             }
 
-            for (const auto& seg : occupiedVertical) {
-                if (std::abs(seg.x - x) < trackGap && rangesOverlap(y0, y1, seg.y0, seg.y1)) {
+            auto [ov0, ov1] = occupiedVertical.range(x - trackGap + 0.001, x + trackGap - 0.001);
+            for (auto it = ov0; it != ov1; ++it) {
+                if (rangesOverlap(y0, y1, it->second.first, it->second.second)) {
                     score += 5;
                 }
             }
@@ -1953,8 +2437,9 @@ void applyElkLayout(CircuitGraph& cg) {
                 double x = a.x();
                 double y0 = std::min(a.y(), b.y());
                 double y1 = std::max(a.y(), b.y());
-                for (const auto& v : occupiedVertical) {
-                    if (std::abs(v.x - x) < trackGap && rangesOverlap(y0, y1, v.y0, v.y1)) score += 3;
+                auto [ov0, ov1] = occupiedVertical.range(x - trackGap + 0.001, x + trackGap - 0.001);
+                for (auto it = ov0; it != ov1; ++it) {
+                    if (rangesOverlap(y0, y1, it->second.first, it->second.second)) score += 3;
                 }
                 for (const auto& [hy, hxr] : occupiedHorizontal.data) {
                     if (hy > y0 + 0.001 && hy < y1 - 0.001 && x > hxr.first + 0.001 && x < hxr.second - 0.001) score += 1;
@@ -1966,8 +2451,11 @@ void applyElkLayout(CircuitGraph& cg) {
                 for (const auto& [hy, hxr] : occupiedHorizontal.data) {
                     if (std::abs(hy - y) < trackGap && rangesOverlap(x0, x1, hxr.first, hxr.second)) score += 3;
                 }
-                for (const auto& v : occupiedVertical) {
-                    if (v.x > x0 + 0.001 && v.x < x1 - 0.001 && y > std::min(v.y0, v.y1) + 0.001 && y < std::max(v.y0, v.y1) - 0.001) score += 1;
+                auto [ov0, ov1] = occupiedVertical.range(x0 + 0.001, x1 - 0.001);
+                for (auto it = ov0; it != ov1; ++it) {
+                    const double vy0 = std::min(it->second.first, it->second.second);
+                    const double vy1 = std::max(it->second.first, it->second.second);
+                    if (y > vy0 + 0.001 && y < vy1 - 0.001) score += 1;
                 }
             }
         }
@@ -2126,79 +2614,38 @@ void applyElkLayout(CircuitGraph& cg) {
 
         int n = (int)hyperSegs.size();
 
-        // Build dependency graph (Java ELK createDependencyIfNecessary).
-        auto countCrossH = [](const std::vector<double>& coords, double lo, double hi) {
-            int c = 0;
-            for (double y : coords) if (y > lo + 0.001 && y < hi - 0.001) ++c;
-            return c;
-        };
-
-        std::vector<std::vector<int>> dag2(n);
-        std::vector<int> indeg2(n, 0);
-
-        for (int i = 0; i < n; ++i) {
-            auto& a = hyperSegs[i];
-            if (a.endCoord - a.startCoord < 0.5) continue;
-            for (int j = i + 1; j < n; ++j) {
-                auto& b = hyperSegs[j];
-                if (b.endCoord - b.startCoord < 0.5) continue;
-
-                int cAB = countCrossH(b.incomingCoords, a.startCoord, a.endCoord)
-                        + countCrossH(a.outgoingCoords, b.startCoord, b.endCoord);
-                int cBA = countCrossH(a.incomingCoords, b.startCoord, b.endCoord)
-                        + countCrossH(b.outgoingCoords, a.startCoord, a.endCoord);
-
-                if (cAB < cBA) {
-                    dag2[i].push_back(j); ++indeg2[j];
-                } else if (cBA < cAB) {
-                    dag2[j].push_back(i); ++indeg2[i];
-                } else if (cAB > 0) {
-                    if (a.startCoord <= b.startCoord) { dag2[i].push_back(j); ++indeg2[j]; }
-                    else                              { dag2[j].push_back(i); ++indeg2[i]; }
-                }
-            }
-        }
-
-        // DFS cycle breaking.
-        std::vector<int> color2(n, 0);
-        std::function<void(int)> dfs2 = [&](int u) {
-            color2[u] = 1;
-            for (int ki = (int)dag2[u].size() - 1; ki >= 0; --ki) {
-                int v = dag2[u][ki];
-                if (color2[v] == 1) { --indeg2[v]; dag2[u].erase(dag2[u].begin() + ki); }
-                else if (color2[v] == 0) dfs2(v);
-            }
-            color2[u] = 2;
-        };
-        for (int i = 0; i < n; ++i) if (color2[i] == 0) dfs2(i);
-
-        // Interval graph coloring slot assignment (optimal: slot count = max overlap).
-        // Sort by startCoord, use First-Fit with proper non-overlap check.
+        // Plan B: O(H log H) interval graph coloring via priority queues.
+        // The previous O(H²) dependency-graph (dag2/DFS) was dead code whose
+        // output was never used in the slot assignment; removed entirely.
         std::vector<int> slot2(n, 0);
-        std::vector<std::pair<double,int>> segIdx(n);
-        for (int i = 0; i < n; ++i) segIdx[i] = {hyperSegs[i].startCoord, i};
-        std::sort(segIdx.begin(), segIdx.end());
+        if (n > 0) {
+            std::vector<std::pair<double,int>> segIdx(n);
+            for (int i = 0; i < n; ++i) segIdx[i] = {hyperSegs[i].startCoord, i};
+            std::sort(segIdx.begin(), segIdx.end());
 
-        // Active slots: (endCoord, slot)
-        std::vector<std::pair<double,int>> active;
-        int maxSlot = 0;
-        for (auto& si : segIdx) {
-            int idx = si.second;
-            double lo = hyperSegs[idx].startCoord;
-            double hi = hyperSegs[idx].endCoord;
-            // Remove expired slots (endCoord < lo, no overlap)
-            for (auto it = active.begin(); it != active.end(); ) {
-                if (it->first < lo - 0.001) it = active.erase(it);
-                else ++it;
+            // Min-heap of (endCoord, slot) for active segments.
+            using AE = std::pair<double,int>;
+            std::priority_queue<AE, std::vector<AE>, std::greater<AE>> activeHeap;
+            // Min-heap of freed slot numbers for reuse (always pick smallest).
+            std::priority_queue<int, std::vector<int>, std::greater<int>> freeSlots;
+            int nextNew = 0;
+            for (auto& si : segIdx) {
+                int idx = si.second;
+                double lo = hyperSegs[idx].startCoord;
+                double hi = hyperSegs[idx].endCoord;
+                // Release all slots whose segments ended before lo.
+                // Use a conservative gap (trackGap) to account for busY excursions
+                // beyond the port Y range — prevents V-segment overlap in shared slots.
+                while (!activeHeap.empty() && activeHeap.top().first < lo - trackGap) {
+                    freeSlots.push(activeHeap.top().second);
+                    activeHeap.pop();
+                }
+                int s;
+                if (!freeSlots.empty()) { s = freeSlots.top(); freeSlots.pop(); }
+                else s = nextNew++;
+                slot2[idx] = s;
+                activeHeap.push({hi, s});
             }
-            // Find smallest available slot (by slot number)
-            std::set<int> used;
-            for (auto& a : active) used.insert(a.second);
-            int newSlot = 0;
-            while (used.count(newSlot)) ++newSlot;
-            slot2[idx] = newSlot;
-            maxSlot = std::max(maxSlot, newSlot);
-            active.push_back({hi, newSlot});
         }
         for (int i = 0; i < n; ++i) hyperSegs[i].slot = slot2[i];
 
@@ -2255,16 +2702,71 @@ void applyElkLayout(CircuitGraph& cg) {
     // Java ELK achieves fewer slots via Y-extent-based hyper-edge merging; we approximate
     // the same gap width by scaling the per-slot spacing proportionally.
     const double slotEdgeSpacing = 8.0;
+
+    auto routedGapWidth = [&](int L, double scale) -> double {
+        int numSlots = slotsPerGap.count(L) ? slotsPerGap[L] : 0;
+        double rw = (numSlots == 0)
+            ? minGap
+            : std::max(minGap, 2.0 * edgeNodeSpacingBL + (numSlots - 1) * slotEdgeSpacing);
+        return rw * scale;
+    };
+
+    auto estimateLayoutHeight = [&]() -> double {
+        double minY = std::numeric_limits<double>::max();
+        double maxY = std::numeric_limits<double>::lowest();
+        for (auto* n : cg.nodes) {
+            if (!n) continue;
+            minY = std::min(minY, n->y);
+            maxY = std::max(maxY, n->y + n->height);
+        }
+        if (maxY <= minY) return 0.0;
+        return maxY - minY;
+    };
+
+    auto estimateLayoutWidth = [&](double scale) -> double {
+        double currentX = 0.0;
+        for (const auto& entry : layers) {
+            int L = entry.first;
+            currentX += layerWidths[L] + routedGapWidth(L, scale);
+        }
+        return currentX;
+    };
+
+    // Aspect balancing (iterative): if schematic is tall and narrow, increase layer gaps
+    // to approach target aspect ratio while preserving routing constraints.
+    double aspectGapScale = 1.0;
+    {
+        const double targetRatio = 1.2;   // target height / width
+        const double maxScale = 5.0;      // avoid overly stretched layouts
+        const double tol = 1.02;          // stop if within 2% of target
+
+        double height = estimateLayoutHeight();
+        double width = estimateLayoutWidth(1.0);
+
+        if (height > 0.0 && width > 0.0) {
+            double ratio = height / width;
+            if (ratio > targetRatio) {
+                double desiredWidth = height / targetRatio;
+                aspectGapScale = std::min(maxScale, std::max(1.0, desiredWidth / width));
+
+                // Two refinement steps to compensate for non-uniform gap contributions.
+                for (int it = 0; it < 2; ++it) {
+                    double wIt = estimateLayoutWidth(aspectGapScale);
+                    if (wIt <= 0.0) break;
+                    double rIt = height / wIt;
+                    if (rIt <= targetRatio * tol) break;
+                    aspectGapScale = std::min(maxScale, aspectGapScale * (rIt / targetRatio));
+                }
+            }
+        }
+    }
+
     {
         double currentX = 0.0;
         for (const auto& entry : layers) {
             int L = entry.first;
             layerX[L] = currentX;
-            int numSlots = slotsPerGap.count(L) ? slotsPerGap[L] : 0;
-            double rw = (numSlots == 0)
-                ? minGap
-                : std::max(minGap, 2.0 * edgeNodeSpacingBL + (numSlots - 1) * slotEdgeSpacing);
-            currentX += layerWidths[L] + rw;
+            currentX += layerWidths[L] + routedGapWidth(L, aspectGapScale);
         }
     }
 
@@ -2274,6 +2776,9 @@ void applyElkLayout(CircuitGraph& cg) {
         double lw = layerWidths.count(L) ? layerWidths[L] : 0.0;
         node->x = layerX[L] + 0.5 * (lw - node->width);
     }
+
+    // Build spatial index NOW (after aspect scaling updated all node->x positions).
+    modIdx.build(cg.nodes);
 
     // Compute laneXByGapSeg: segmentX = gapLeft + edgeNodeSpacing + slot * edgeEdgeSpacing.
     // This matches Java ELK: startPos = leftLayerRight + edgeNodeSpacing,
@@ -2295,8 +2800,6 @@ void applyElkLayout(CircuitGraph& cg) {
             }
         }
     }
-
-    int backwardLaneCounter = 0;
 
     // Count slot assignment coverage for diagnostics.
     {
@@ -2414,11 +2917,17 @@ void applyElkLayout(CircuitGraph& cg) {
         }
     }
 
-    // For very large graphs, skip expensive per-edge channel refinement (crossingScoreAtY
-    // scans occupiedVertical which grows to O(E) → O(E²) total).
-    const bool skipExpensiveRouteOpts = (routeEdges.size() > 10000);
+    // Large graphs (>10000 edges): automatically skip expensive per-edge refinement
+    // (busY 121-candidate search, refineHorizontalY, occupancy tracking writes).
+    // This eliminates the O(E^2) accumulated occupied-list growth entirely.
+    // ROUTE_FAST_MODE=1 forces this regardless of graph size.
+    const bool fastMode = (routeEdges.size() > 10000) ||
+                          (qgetenv("ROUTE_FAST_MODE") == "1");
+    const bool skipExpensiveRouteOpts = fastMode && (routeEdges.size() > 10000);
 
-    for (auto* edge : routeEdges) {
+    // Route one edge.  All shared data is read-only when skipExpensiveRouteOpts=true,
+    // enabling safe parallel execution across edges.
+    auto routeOneEdge = [&](CEdge* edge) {
         edge->points.clear();
         QPointF start = sourceAnchor(edge);
         QPointF end = targetAnchor(edge);
@@ -2444,15 +2953,16 @@ void applyElkLayout(CircuitGraph& cg) {
                 edge->points.push_back(end);
                 normalizePolyline(edge->points);
 
-                auto* elkEdge = elkEdgeMap[edge];
-                if (elkEdge) {
-                    elkEdge->clearBendPoints();
+                auto elkIt = elkEdgeMap.find(edge);
+                if (elkIt != elkEdgeMap.end() && elkIt->second) {
+                    elkIt->second->clearBendPoints();
                     for (size_t index = 1; index + 1 < edge->points.size(); ++index) {
-                        elkEdge->addBendPoint(edge->points[index].x(), edge->points[index].y());
+                        elkIt->second->addBendPoint(edge->points[index].x(), edge->points[index].y());
                     }
                 }
-                occupiedHorizontal.push_back({yDirect, start.x(), end.x()});
-                continue;
+                if (!skipExpensiveRouteOpts)
+                    occupiedHorizontal.push_back({yDirect, start.x(), end.x()});
+                return; // done with this edge
             }
         }
 
@@ -2472,86 +2982,186 @@ void applyElkLayout(CircuitGraph& cg) {
                 if (std::abs(start.y() - end.y()) < 0.5) {
                     edge->points.push_back(end);
                 } else {
+                    // Shift gX if this backward V segment conflicts with existing V segments.
+                    if (!skipExpensiveRouteOpts && !occupiedVertical.empty()) {
+                        double vLo = std::min(start.y(), end.y());
+                        double vHi = std::max(start.y(), end.y());
+                        auto vConflict = [&](double x) -> bool {
+                            auto [v0, v1] = occupiedVertical.range(x - 2.0, x + 2.0);
+                            for (auto it = v0; it != v1; ++it) {
+                                double lo = std::min(it->second.first, it->second.second);
+                                double hi = std::max(it->second.first, it->second.second);
+                                if (std::min(hi, vHi) - std::max(lo, vLo) > trackGap) return true;
+                            }
+                            return false;
+                        };
+                        if (vConflict(gX)) {
+                            double gapLo = std::min(end.x(), start.x());
+                            double gapHi = std::max(end.x(), start.x());
+                            for (int d = 1; d <= 15; ++d) {
+                                double tryP = gX + d * routeStep;
+                                double tryM = gX - d * routeStep;
+                                if (tryP <= gapHi - 1.0 && !vConflict(tryP)) { gX = tryP; break; }
+                                if (tryM >= gapLo + 1.0 && !vConflict(tryM)) { gX = tryM; break; }
+                            }
+                        }
+                    }
                     edge->points.push_back(QPointF(gX, start.y()));
                     edge->points.push_back(QPointF(gX, end.y()));
                     edge->points.push_back(end);
                 }
             } else {
-            // Long backward edge: route around the right side via backChannelX.
-            int lane = backwardLaneCounter++ % backwardLaneWindow;
-            double baseChannelX = backChannelX + lane * std::max(trackGap, 8.0);
+            // Long backward edge: stay inside the schematic envelope.
+            // Route through the internal gaps next to the source and target layers
+            // instead of using an outer channel to the left of input ports.
+            double gXSrc = gapMidX(srcLayer - 1);
+            double gXTgt = gapMidX(tgtLayer);
 
-            double yA = findSafeHorizontalChannelY(
-                start.y(), start.x(), baseChannelX,
+            if (gXSrc < 0) gXSrc = start.x() - lspacing * 0.5;
+            if (gXTgt < 0) gXTgt = end.x() + lspacing * 0.5;
+            if (gXSrc <= gXTgt) {
+                double mid = (start.x() + end.x()) * 0.5;
+                gXSrc = std::max(mid, end.x() + routeStep);
+                gXTgt = std::min(mid, start.x() - routeStep);
+            }
+
+            // Keep first/last horizontal stubs outside endpoint module bodies.
+            // If the start port is on a node's right edge, do not route first bend to the left
+            // through the source body (and symmetric for left edge). Same for target entry.
+            if (edge->source) {
+                double sxL = edge->source->x;
+                double sxR = edge->source->x + edge->source->width;
+                if (std::abs(start.x() - sxR) < 1.0 && gXSrc < sxR + 1.0)
+                    gXSrc = sxR + routeStep;
+                else if (std::abs(start.x() - sxL) < 1.0 && gXSrc > sxL - 1.0)
+                    gXSrc = sxL - routeStep;
+            }
+            if (edge->target) {
+                double txL = edge->target->x;
+                double txR = edge->target->x + edge->target->width;
+                if (std::abs(end.x() - txL) < 1.0 && gXTgt > txL - 1.0)
+                    gXTgt = txL - routeStep;
+                else if (std::abs(end.x() - txR) < 1.0 && gXTgt < txR + 1.0)
+                    gXTgt = txR + routeStep;
+            }
+
+            if (gXSrc <= gXTgt + 1.0) {
+                double mid = (start.x() + end.x()) * 0.5;
+                gXSrc = std::max(gXSrc, mid + routeStep);
+                gXTgt = std::min(gXTgt, mid - routeStep);
+            }
+
+            double xL = std::min(gXTgt, gXSrc);
+            double xR = std::max(gXTgt, gXSrc);
+            double prefBusY = (start.y() + end.y()) * 0.5;
+            double busY = findSafeHorizontalChannelY(
+                prefBusY, xL, xR,
                 modIdx, edge->source, edge->target,
                 occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-            double yB = findSafeHorizontalChannelY(
-                end.y(), baseChannelX, end.x(),
-                modIdx, edge->source, edge->target,
-                occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
 
-            auto crossingScoreAtY = [&](double y, double xL, double xR) {
-                int score = 0;
-                double x0 = std::min(xL, xR) + 0.5;
-                double x1 = std::max(xL, xR) - 0.5;
-                for (const auto& vs : occupiedVertical) {
-                    if (vs.x < x0 || vs.x > x1) continue;
-                    double vy0 = std::min(vs.y0, vs.y1);
-                    double vy1 = std::max(vs.y0, vs.y1);
-                    if (y > vy0 + 0.001 && y < vy1 - 0.001) score++;
+            // Ensure busY horizontal segment doesn't enter source/target interiors.
+            // Check if H-segment at busY crosses through source or target module bodies.
+            auto busH_avoids_endpoints = [&](double y) -> bool {
+                if (edge->source) {
+                    double sy0 = edge->source->y, sy1 = edge->source->y + edge->source->height;
+                    if (y > sy0 + 1.0 && y < sy1 - 1.0) {
+                        // H-segment is vertically inside source; check X-range overlap.
+                        double sx0 = edge->source->x + 1.0, sx1 = edge->source->x + edge->source->width - 1.0;
+                        double lo = std::max(sx0, xL), hi = std::min(sx1, xR);
+                        if (hi - lo > 0.1) return false;  // significant overlap
+                    }
                 }
-                return score;
+                if (edge->target) {
+                    double ty0 = edge->target->y, ty1 = edge->target->y + edge->target->height;
+                    if (y > ty0 + 1.0 && y < ty1 - 1.0) {
+                        // H-segment is vertically inside target; check X-range overlap.
+                        double tx0 = edge->target->x + 1.0, tx1 = edge->target->x + edge->target->width - 1.0;
+                        double lo = std::max(tx0, xL), hi = std::min(tx1, xR);
+                        if (hi - lo > 0.1) return false;  // significant overlap
+                    }
+                }
+                return true;
             };
 
-            auto refineHorizontalY = [&](double prefY, double xL, double xR) {
-                double y = findSafeHorizontalChannelY(
-                    prefY, xL, xR,
-                    modIdx, edge->source, edge->target,
-                    occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-                int bestScore = crossingScoreAtY(y, xL, xR);
-                double bestY = y;
-                double bestDist = std::abs(bestY - prefY);
-                if (bestScore > 0) {
-                    for (int sign : {-1, 1}) {
-                        double candPref = prefY + sign * routeStep;
-                        double candY = findSafeHorizontalChannelY(
-                            candPref, xL, xR,
-                            modIdx, edge->source, edge->target,
-                            occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-                        int candScore = crossingScoreAtY(candY, xL, xR);
-                        double candDist = std::abs(candY - prefY);
-                        if (candScore < bestScore || (candScore == bestScore && candDist + 1e-6 < bestDist)) {
-                            bestScore = candScore;
-                            bestY = candY;
-                            bestDist = candDist;
+            if (!busH_avoids_endpoints(busY)) {
+                // Current busY crosses source/target; search for safe Y.
+                for (int d = 1; d <= 50; ++d) {
+                    double tryY = busY + d * routeStep;
+                    if (tryY <= safeMaxY && busH_avoids_endpoints(tryY)) { busY = tryY; break; }
+                    tryY = busY - d * routeStep;
+                    if (tryY >= safeMinY && busH_avoids_endpoints(tryY)) { busY = tryY; break; }
+                }
+            }
+
+            // Double-check: ensure busY doesn't create H-overlap with already-routed nets.
+            if (!skipExpensiveRouteOpts && !occupiedHorizontal.empty()) {
+                auto busY_has_h_overlap = [&](double y) -> bool {
+                    auto [h0, h1] = occupiedHorizontal.range(y - trackGap + 0.001, y + trackGap - 0.001);
+                    for (auto it = h0; it != h1; ++it) {
+                        double oLo = std::max(xL, it->second.first);
+                        double oHi = std::min(xR, it->second.second);
+                        if (oHi - oLo > trackGap) return true;
+                    }
+                    return false;
+                };
+
+                if (busY_has_h_overlap(busY)) {
+                    bool found = false;
+                    // Try 10*routeStep offsets in both directions.
+                    for (int d = 1; d <= 50; ++d) {
+                        double tryY = busY + d * routeStep;
+                        if (tryY <= safeMaxY && !busY_has_h_overlap(tryY)) { busY = tryY; found = true; break; }
+                        tryY = busY - d * routeStep;
+                        if (tryY >= safeMinY && !busY_has_h_overlap(tryY)) { busY = tryY; found = true; break; }
+                    }
+                    // If still not found, try in finer steps (half-routeStep).
+                    if (!found) {
+                        for (int d = 1; d <= 100; ++d) {
+                            double tryY = busY + d * routeStep * 0.5;
+                            if (tryY <= safeMaxY && !busY_has_h_overlap(tryY)) { busY = tryY; found = true; break; }
+                            tryY = busY - d * routeStep * 0.5;
+                            if (tryY >= safeMinY && !busY_has_h_overlap(tryY)) { busY = tryY; found = true; break; }
                         }
                     }
                 }
-                return bestY;
-            };
-
-            if (!skipExpensiveRouteOpts) {
-                yA = refineHorizontalY(yA, start.x(), baseChannelX);
-                yB = refineHorizontalY(yB, baseChannelX, end.x());
             }
 
-            double channelX = findSafeVerticalChannelX(
-                baseChannelX, yA, yB,
-                modIdx, edge->source, edge->target,
-                occupiedVertical, trackGap, routeStep, safeMinX, safeMaxX + 5.0 * routeStep);
-            yA = findSafeHorizontalChannelY(
-                yA, start.x(), channelX,
-                modIdx, edge->source, edge->target,
-                occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
-            yB = findSafeHorizontalChannelY(
-                yB, channelX, end.x(),
-                modIdx, edge->source, edge->target,
-                occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
+            // Avoid V-segment overlap on both backward legs if possible.
+            if (!skipExpensiveRouteOpts && !occupiedVertical.empty()) {
+                auto vSegFree = [&](double x, double yA, double yB) -> bool {
+                    double vLo = std::min(yA, yB);
+                    double vHi = std::max(yA, yB);
+                    auto [v0, v1] = occupiedVertical.range(x - 2.0, x + 2.0);
+                    for (auto it = v0; it != v1; ++it) {
+                        double lo = std::min(it->second.first, it->second.second);
+                        double hi = std::max(it->second.first, it->second.second);
+                        if (std::min(hi, vHi) - std::max(lo, vLo) > trackGap) return false;
+                    }
+                    return true;
+                };
 
-            edge->points.push_back(QPointF(start.x(), yA));
-            edge->points.push_back(QPointF(channelX, yA));
-            edge->points.push_back(QPointF(channelX, yB));
-            edge->points.push_back(QPointF(end.x(), yB));
+                if (!vSegFree(gXSrc, start.y(), busY)) {
+                    for (int d = 1; d <= 12; ++d) {
+                        double tryL = gXSrc - d * routeStep;
+                        if (tryL > gXTgt + 1.0 && vSegFree(tryL, start.y(), busY)) { gXSrc = tryL; break; }
+                        double tryR = gXSrc + d * routeStep;
+                        if (tryR < start.x() - 1.0 && vSegFree(tryR, start.y(), busY)) { gXSrc = tryR; break; }
+                    }
+                }
+                if (!vSegFree(gXTgt, busY, end.y())) {
+                    for (int d = 1; d <= 12; ++d) {
+                        double tryR = gXTgt + d * routeStep;
+                        if (tryR < gXSrc - 1.0 && vSegFree(tryR, busY, end.y())) { gXTgt = tryR; break; }
+                        double tryL = gXTgt - d * routeStep;
+                        if (tryL > end.x() + 1.0 && vSegFree(tryL, busY, end.y())) { gXTgt = tryL; break; }
+                    }
+                }
+            }
+
+            edge->points.push_back(QPointF(gXSrc, start.y()));
+            edge->points.push_back(QPointF(gXSrc, busY));
+            edge->points.push_back(QPointF(gXTgt, busY));
+            edge->points.push_back(QPointF(gXTgt, end.y()));
             edge->points.push_back(end);
             } // end long backward edge
         } else if (span == 1) {
@@ -2581,21 +3191,13 @@ void applyElkLayout(CircuitGraph& cg) {
                 edge->points.push_back(end);
             }
         } else {
-            // Long forward edge (span > 1): bus routing — 4 waypoints, same as Java ELK.
-            // Anchor-flipped strategy: gX1 near RIGHT of srcGap, gX2 near LEFT of tgtGap.
-            // For span=2: busH passes only through layer(srcLayer+1) region (no V segs there) → 0 crossings.
-            // For span=3+: srcGap and tgtGap contributions eliminated; only intermediate gaps remain.
-            // Per-source-port groupRank offsets spread V segments across different X positions → low congestion.
+            // Long forward edge (span > 1): bus routing — single busY spanning gX1..gX2.
+            // gX1 = V-seg X in srcLayer gap, gX2 = V-seg X in (tgtLayer-1) gap.
+            // Shape: start → (gX1,start.y) → (gX1,busY) → (gX2,busY) → (gX2,end.y) → end
             {
                 auto eIt = edgeIndex.find(edge);
                 int eidx = (eIt != edgeIndex.end()) ? eIt->second : -1;
-                (void)eidx;
 
-                // Optimal strategy: use laneXByGapSeg slot assignments for gX1 and gX2.
-                // Slot assignment spreads V segments across all available X positions per gap,
-                // reducing max congestion from 13 (gapMidX baseline) to 8 (slot baseline).
-                // Crossings increase from 2545 to 2742 due to longer busH coverage of intermediate gaps,
-                // but this is acceptable tradeoff vs unacceptable congestion=13.
                 double gX1 = gapMidX(srcLayer);
                 double gX2 = gapMidX(tgtLayer - 1);
                 if (gX1 < 0) gX1 = start.x() + lspacing * 0.5;
@@ -2607,7 +3209,6 @@ void applyElkLayout(CircuitGraph& cg) {
                     if (it2 != laneXByGapSeg.end()) gX2 = it2->second;
                 }
 
-                // Safety: if gX1>=gX2 (shouldn't happen for forward edges), fall back to gapMidX.
                 if (gX1 >= gX2) {
                     gX1 = gapMidX(srcLayer);
                     if (gX1 < 0) gX1 = start.x() + lspacing * 0.5;
@@ -2622,34 +3223,83 @@ void applyElkLayout(CircuitGraph& cg) {
                     double xR = std::max(gX1, gX2);
                     double prefBusY = (start.y() + end.y()) * 0.5;
 
+                    double qxL = std::min({start.x(), gX1, gX2, end.x()});
+                    double qxR = std::max({start.x(), gX1, gX2, end.x()});
+
                     double busY = findSafeHorizontalChannelY(
-                        prefBusY, xL, xR, modIdx, edge->source, edge->target,
+                        prefBusY, qxL, qxR, modIdx, edge->source, edge->target,
                         occupiedHorizontal, trackGap, routeStep, safeMinY, safeMaxY);
 
+                    // Optional: V-crossing minimization (expensive, skip for large graphs).
                     if (!skipExpensiveRouteOpts && !occupiedVertical.empty()) {
-                        auto countVCross = [&](double y) -> int {
-                            int cnt = 0;
-                            for (const auto& vs : occupiedVertical) {
-                                if (vs.x < xL - 0.5 || vs.x > xR + 0.5) continue;
-                                double vy0 = std::min(vs.y0, vs.y1), vy1 = std::max(vs.y0, vs.y1);
-                                if (y > vy0 + 0.5 && y < vy1 - 0.5) ++cnt;
+                        std::vector<double> vCrossLo;
+                        std::vector<double> vCrossHi;
+                        {
+                            auto [ov0, ov1] = occupiedVertical.range(xL - 0.5, xR + 0.5);
+                            for (auto it = ov0; it != ov1; ++it) {
+                                double lo = std::min(it->second.first, it->second.second) + 0.5;
+                                double hi = std::max(it->second.first, it->second.second) - 0.5;
+                                if (lo < hi) {
+                                    vCrossLo.push_back(lo);
+                                    vCrossHi.push_back(hi);
+                                }
                             }
+                            std::sort(vCrossLo.begin(), vCrossLo.end());
+                            std::sort(vCrossHi.begin(), vCrossHi.end());
+                        }
+
+                        auto yKey = [&](double y) -> long long {
+                            return static_cast<long long>(std::llround(y * 1000.0));
+                        };
+                        std::unordered_map<long long, int> tcCache;
+                        std::unordered_map<long long, bool> modSafeCache;
+                        std::unordered_map<long long, bool> safeCache;
+
+                        auto countVCross = [&](double y) -> int {
+                            auto k = yKey(y);
+                            auto itc = tcCache.find(k);
+                            if (itc != tcCache.end()) return itc->second;
+                            int cnt = 0;
+                            if (!vCrossLo.empty()) {
+                                const auto loCount = std::lower_bound(vCrossLo.begin(), vCrossLo.end(), y) - vCrossLo.begin();
+                                const auto hiCount = std::upper_bound(vCrossHi.begin(), vCrossHi.end(), y) - vCrossHi.begin();
+                                cnt = static_cast<int>(loCount - hiCount);
+                            }
+                            tcCache.emplace(k, cnt);
                             return cnt;
                         };
                         auto isModSafe = [&](double y) -> bool {
+                            auto k = yKey(y);
+                            auto itm = modSafeCache.find(k);
+                            if (itm != modSafeCache.end()) return itm->second;
                             auto [mn0, mn1] = modIdx.candidatesForY(y, 4.0);
                             for (auto it = mn0; it != mn1; ++it) {
                                 const CNode* n = it->second;
                                 if (n == edge->source || n == edge->target) continue;
-                                if (horizontalSegmentIntersectsRect(y, xL, xR, n)) return false;
+                                if (horizontalSegmentIntersectsRect(y, xL, xR, n)) {
+                                    modSafeCache.emplace(k, false);
+                                    return false;
+                                }
                             }
+                            modSafeCache.emplace(k, true);
                             return true;
                         };
                         auto isSafe = [&](double y) -> bool {
-                            if (!isModSafe(y)) return false;
+                            auto k = yKey(y);
+                            auto its = safeCache.find(k);
+                            if (its != safeCache.end()) return its->second;
+
+                            if (!isModSafe(y)) {
+                                safeCache.emplace(k, false);
+                                return false;
+                            }
                             auto [ht0, ht1] = occupiedHorizontal.range(y - trackGap + 0.001, y + trackGap - 0.001);
                             for (auto it = ht0; it != ht1; ++it)
-                                if (rangesOverlap(xL, xR, it->second.first, it->second.second)) return false;
+                                if (rangesOverlap(xL, xR, it->second.first, it->second.second)) {
+                                    safeCache.emplace(k, false);
+                                    return false;
+                                }
+                            safeCache.emplace(k, true);
                             return true;
                         };
                         std::vector<double> candYs;
@@ -2679,6 +3329,41 @@ void applyElkLayout(CircuitGraph& cg) {
                         busY = bestBusY;
                     }
 
+                    // V-segment overlap prevention.
+                    if (!skipExpensiveRouteOpts && !occupiedVertical.empty()) {
+                        auto vSegFree = [&](double gX, double yA, double yB) -> bool {
+                            double vLo = std::min(yA, yB);
+                            double vHi = std::max(yA, yB);
+                            auto [ov0, ov1] = occupiedVertical.range(gX - 2.0, gX + 2.0);
+                            for (auto it = ov0; it != ov1; ++it) {
+                                double lo = std::min(it->second.first, it->second.second);
+                                double hi = std::max(it->second.first, it->second.second);
+                                double oLo = std::max(lo, vLo);
+                                double oHi = std::min(hi, vHi);
+                                if (oHi - oLo > trackGap) return false;
+                            }
+                            return true;
+                        };
+                        if (!vSegFree(gX1, start.y(), busY)) {
+                            for (int d = 1; d <= 10; ++d) {
+                                double tryX = gX1 + d * routeStep;
+                                if (tryX < gX2 - 0.5 && vSegFree(tryX, start.y(), busY)) { gX1 = tryX; break; }
+                                tryX = gX1 - d * routeStep;
+                                if (tryX > start.x() + 0.5 && vSegFree(tryX, start.y(), busY)) { gX1 = tryX; break; }
+                            }
+                        }
+                        if (!vSegFree(gX2, busY, end.y())) {
+                            for (int d = 1; d <= 10; ++d) {
+                                double tryX = gX2 - d * routeStep;
+                                if (tryX > gX1 + 0.5 && vSegFree(tryX, busY, end.y())) { gX2 = tryX; break; }
+                                tryX = gX2 + d * routeStep;
+                                if (tryX < end.x() - 0.5 && vSegFree(tryX, busY, end.y())) { gX2 = tryX; break; }
+                            }
+                        }
+                        xL = std::min(gX1, gX2);
+                        xR = std::max(gX1, gX2);
+                    }
+
                     edge->points.push_back(QPointF(gX1, start.y()));
                     edge->points.push_back(QPointF(gX1, busY));
                     if (std::abs(gX2 - gX1) > 0.5)
@@ -2688,6 +3373,75 @@ void applyElkLayout(CircuitGraph& cg) {
                 }
             }
         }
+
+        // Generic endpoint-stub correction: for any orthogonal route pattern,
+        // keep first/last horizontal stubs outside source/target module bodies.
+        // This prevents visible horizontal segments crossing through instances
+        // like alu_inst/reg_b when gX is chosen on the wrong side.
+        auto keepEndpointStubOutside = [&](std::vector<QPointF>& pts) {
+            if (pts.size() < 2) return;
+            constexpr double EPS = 1e-3;
+
+            auto adjustSource = [&]() {
+                if (!edge->source || pts.size() < 3) return;
+                QPointF& p0 = pts[0];
+                QPointF& p1 = pts[1];
+                if (std::abs(p0.y() - p1.y()) > 0.5) return; // only horizontal first stub
+
+                double sxL = edge->source->x;
+                double sxR = edge->source->x + edge->source->width;
+                double oldX = p1.x();
+                double newX = oldX;
+
+                if (std::abs(p0.x() - sxR) < 1.0 && p1.x() < sxR + 1.0)
+                    newX = sxR + routeStep;
+                else if (std::abs(p0.x() - sxL) < 1.0 && p1.x() > sxL - 1.0)
+                    newX = sxL - routeStep;
+
+                if (std::abs(newX - oldX) > EPS) {
+                    p1.setX(newX);
+                    if (pts.size() >= 3) {
+                        QPointF& p2 = pts[2];
+                        // Keep first vertical leg aligned with moved bend X.
+                        if (std::abs(p2.x() - oldX) < 1.0 && std::abs(p2.y() - p1.y()) > 0.5)
+                            p2.setX(newX);
+                    }
+                }
+            };
+
+            auto adjustTarget = [&]() {
+                if (!edge->target || pts.size() < 3) return;
+                QPointF& pn = pts.back();
+                QPointF& pnm1 = pts[pts.size() - 2];
+                if (std::abs(pn.y() - pnm1.y()) > 0.5) return; // only horizontal last stub
+
+                double txL = edge->target->x;
+                double txR = edge->target->x + edge->target->width;
+                double oldX = pnm1.x();
+                double newX = oldX;
+
+                if (std::abs(pn.x() - txL) < 1.0 && pnm1.x() > txL - 1.0)
+                    newX = txL - routeStep;
+                else if (std::abs(pn.x() - txR) < 1.0 && pnm1.x() < txR + 1.0)
+                    newX = txR + routeStep;
+
+                if (std::abs(newX - oldX) > EPS) {
+                    pnm1.setX(newX);
+                    if (pts.size() >= 3) {
+                        QPointF& pnm2 = pts[pts.size() - 3];
+                        // Keep last vertical leg aligned with moved bend X.
+                        if (std::abs(pnm2.x() - oldX) < 1.0 && std::abs(pnm2.y() - pnm1.y()) > 0.5)
+                            pnm2.setX(newX);
+                    }
+                }
+            };
+
+            adjustSource();
+            adjustTarget();
+            normalizePolyline(pts);
+        };
+        keepEndpointStubOutside(edge->points);
+
         // Module-collision repair: only triggered for edges that pass through module bodies.
         // Scoring is O(nodes) only - no occupancy list scan to keep routing O(E * N).
         // For large graphs, skip this O(E*N) check entirely.
@@ -2709,8 +3463,20 @@ void applyElkLayout(CircuitGraph& cg) {
                     if (gX2 > gX1 + 1.0) p.push_back(QPointF(gX2, busY));
                     p.push_back(QPointF(gX2, end.y()));
                 } else {
-                    p.push_back(QPointF(start.x(), busY));
-                    p.push_back(QPointF(end.x(),   busY));
+                    // Backward edge repair: use gap X positions to keep V-segs in inter-layer
+                    // gaps rather than at node edge X positions (which may cross adjacent nodes).
+                    double gXS = gapMidX(srcLayer - 1);
+                    double gXT = gapMidX(tgtLayer);
+                    if (gXS < 0) gXS = start.x() + lspacing * 0.5;
+                    if (gXT < 0) gXT = end.x()   - lspacing * 0.5;
+                    if (gXS <= gXT) {
+                        gXS = start.x() + lspacing * 0.5;
+                        gXT = end.x()   - lspacing * 0.5;
+                    }
+                    p.push_back(QPointF(gXS, start.y()));
+                    p.push_back(QPointF(gXS, busY));
+                    p.push_back(QPointF(gXT, busY));
+                    p.push_back(QPointF(gXT, end.y()));
                 }
                 p.push_back(end);
                 normalizePolyline(p);
@@ -2729,6 +3495,7 @@ void applyElkLayout(CircuitGraph& cg) {
             std::vector<QPointF> bestPath = edge->points;
 
             auto tryPath = [&](std::vector<QPointF> p) {
+                keepEndpointStubOutside(p);
                 int s = repairScore(p);
                 if (s < bestScore) { bestScore = s; bestPath = std::move(p); }
             };
@@ -2754,29 +3521,68 @@ void applyElkLayout(CircuitGraph& cg) {
             }
 
             edge->points = bestPath;
+            keepEndpointStubOutside(edge->points);
         }
 
         // Mark occupied tracks after final routing of this edge.
-        // For large graphs, skip this to avoid O(E^2) accumulated scan time.
-        if (!skipExpensiveRouteOpts) {
-        for (size_t i = 1; i < edge->points.size(); ++i) {
-            const QPointF& a = edge->points[i - 1];
-            const QPointF& b = edge->points[i];
-            if (std::abs(a.x() - b.x()) < 0.001) {
-                occupiedVertical.push_back({a.x(), a.y(), b.y()});
-            } else if (std::abs(a.y() - b.y()) < 0.001) {
-                occupiedHorizontal.push_back({a.y(), a.x(), b.x()});
+        // Record all H-segments to ensure accurate overlap detection.
+        // Even for large graphs, recording all H-segs helps findSafeHorizontalChannelY
+        // make better decisions by checking against the full occupancy state.
+        {
+            for (size_t i = 1; i < edge->points.size(); ++i) {
+                const QPointF& a = edge->points[i - 1];
+                const QPointF& b = edge->points[i];
+                if (std::abs(a.x() - b.x()) < 0.001) {
+                    if (!skipExpensiveRouteOpts) {
+                        occupiedVertical.push_back({a.x(), a.y(), b.y()});
+                    }
+                } else if (std::abs(a.y() - b.y()) < 0.001) {
+                    // Record all H-segments for all edges (including span=1).
+                    // This provides accurate occupancy info for busY selection in subsequent edges.
+                    occupiedHorizontal.push_back({a.y(), a.x(), b.x()});
+                }
             }
         }
-        }
 
-        auto* elkEdge = elkEdgeMap[edge];
-        if (!elkEdge) {
-            continue;
+        {
+            auto elkIt = elkEdgeMap.find(edge);
+            auto* elkEdge = (elkIt != elkEdgeMap.end()) ? elkIt->second : nullptr;
+            if (!elkEdge) return;
+            elkEdge->clearBendPoints();
+            for (size_t index = 1; index + 1 < edge->points.size(); ++index) {
+                elkEdge->addBendPoint(edge->points[index].x(), edge->points[index].y());
+            }
         }
-        elkEdge->clearBendPoints();
-        for (size_t index = 1; index + 1 < edge->points.size(); ++index) {
-            elkEdge->addBendPoint(edge->points[index].x(), edge->points[index].y());
+    }; // end routeOneEdge
+
+    // Dispatch: parallel for large graphs (skipExpensiveRouteOpts → no shared writes),
+    //           serial for small graphs (occupancy tracking requires serial order).
+    if (skipExpensiveRouteOpts && (int)routeEdges.size() > 200) {
+        const int nEdges = (int)routeEdges.size();
+        const int nT = std::max(1, std::min(
+            (int)std::thread::hardware_concurrency(), nEdges));
+        std::atomic<int> edgeCounter{0};
+        std::vector<std::thread> workers;
+        workers.reserve(nT);
+        for (int t = 0; t < nT; ++t) {
+            workers.emplace_back([&]() {
+                for (int i = edgeCounter.fetch_add(1, std::memory_order_relaxed);
+                     i < nEdges;
+                     i = edgeCounter.fetch_add(1, std::memory_order_relaxed)) {
+                    routeOneEdge(routeEdges[i]);
+                }
+            });
         }
+        for (auto& w : workers) w.join();
+    } else {
+        for (auto* edge : routeEdges) routeOneEdge(edge);
+    }
+
+    logPhase("edge routing");
+
+    // ---- Restore full node/edge lists after hierarchical layout ----
+    if (didHierarchicalFilter) {
+        cg.nodes = std::move(savedHierNodes);
+        cg.edges = std::move(savedHierEdges);
     }
 }

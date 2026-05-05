@@ -93,6 +93,64 @@ public:
         if (netlist.modules.count(topModuleName) == 0) return;
         const Module& topModule = netlist.modules.at(topModuleName);
         buildRecursive(netlist, topModule, "", nullptr);
+        normalizeInstancePortSidesFromConnectivity(netlist);
+    }
+
+    // Some large/real-world netlists may have incomplete port direction metadata.
+    // Reconcile instance pin sides from actual connectivity: driver pins on EAST,
+    // sink pins on WEST. Keep original side for bidirectional/ambiguous pins.
+    void normalizeInstancePortSidesFromConnectivity(const Netlist& netlist) {
+        std::map<CNode*, std::set<std::string>> drivenPins;
+        std::map<CNode*, std::set<std::string>> sinkPins;
+
+        for (const auto* e : edges) {
+            if (e->source && !e->sourcePort.empty()) {
+                drivenPins[e->source].insert(e->sourcePort);
+            }
+            if (e->target && !e->targetPort.empty()) {
+                sinkPins[e->target].insert(e->targetPort);
+            }
+        }
+
+        for (auto* n : nodes) {
+            if (n->data.type != CircuitNodeType::ModuleInstance &&
+                n->data.type != CircuitNodeType::ExpandedInstance) {
+                continue;
+            }
+
+            std::map<std::string, std::string> declaredDir;
+            auto mit = netlist.modules.find(n->data.moduleType);
+            if (mit != netlist.modules.end()) {
+                for (const auto& mp : mit->second.ports) {
+                    declaredDir[mp.name] = mp.direction;
+                }
+            }
+
+            for (auto& p : n->ports) {
+                const bool isDriver = drivenPins[n].count(p.name) > 0;
+                const bool isSink = sinkPins[n].count(p.name) > 0;
+
+                if (isDriver && !isSink) {
+                    p.side = "EAST";
+                    p.x = n->width - p.width;
+                } else if (isSink && !isDriver) {
+                    p.side = "WEST";
+                    p.x = 0.0;
+                } else {
+                    // Ambiguous/unconnected pins: use declared direction as fallback.
+                    auto dit = declaredDir.find(p.name);
+                    if (dit != declaredDir.end()) {
+                        if (dit->second == "input") {
+                            p.side = "WEST";
+                            p.x = 0.0;
+                        } else if (dit->second == "output") {
+                            p.side = "EAST";
+                            p.x = n->width - p.width;
+                        }
+                    }
+                }
+            }
+        }
     }
     
     void buildRecursive(const Netlist& netlist, const Module& module, std::string pathPrefix, CNode* parent) {
@@ -503,22 +561,22 @@ private:
        
        if (!n->ports.empty()) {
            QJsonArray portsArr;
-           std::map<std::string, int> sideIndices;
-           bool fixedPos = (n->data.type == CircuitNodeType::ModuleInstance);
+           const bool sideOnlyPorts =
+               (n->data.type == CircuitNodeType::ModuleInstance ||
+                n->data.type == CircuitNodeType::ExpandedInstance);
 
            for(const auto& p : n->ports) {
                QJsonObject pObj;
                pObj["id"] = QString::fromStdString(p.id); 
                pObj["width"] = p.width;
                pObj["height"] = p.height;
-               pObj["x"] = p.x;
-               pObj["y"] = p.y;
+               if (!sideOnlyPorts) {
+                   pObj["x"] = p.x;
+                   pObj["y"] = p.y;
+               }
                
                QJsonObject lo;
                lo["elk.port.side"] = QString::fromStdString(p.side);
-               if (!fixedPos) {
-                   lo["elk.port.index"] = sideIndices[p.side]++;
-               }
                
                pObj["layoutOptions"] = lo;
                portsArr.append(pObj);
@@ -553,8 +611,8 @@ private:
             lOpts["elk.nodeSize.constraints"] = "FIXED"; 
             
             if (n->data.type == CircuitNodeType::ModuleInstance) {
-                 lOpts["elk.portConstraints"] = "FIXED_POS"; 
-                 lOpts["org.eclipse.elk.portConstraints"] = "FIXED_POS";
+                  lOpts["elk.portConstraints"] = "FIXED_SIDE"; 
+                  lOpts["org.eclipse.elk.portConstraints"] = "FIXED_SIDE";
                  lOpts["elk.layered.nodePlacement.bk.fixedAlignment"] = "TERMINAL_ALIGNED";
                  lOpts["org.eclipse.elk.layered.nodePlacement.bk.fixedAlignment"] = "TERMINAL_ALIGNED";
             }
